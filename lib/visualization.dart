@@ -167,79 +167,110 @@ abstract class Visualization {
 /// Frame compositor: retains the previous frame as a GPU image,
 /// decays it by settings.trailRetention, then lets the active
 /// visualization draw on top. Output is a premultiplied transparent
-/// RGBA image suitable for live blit and PNG export alike.
+/// RGBA image suitable for live blit and raw-pixel export alike.
+///
+/// FRAME OWNERSHIP MODEL (the VRAM fix):
+///
+/// The historical export leak (~6 GB/min) was never the trail draw
+/// itself -- it was frame lifetime. Superseded ui.Images were left
+/// to the GC, which does not feel GPU memory pressure, so textures
+/// accumulated (~8 MB/frame at 1080p) far faster than any collection
+/// reclaimed them. Skipping the trail during export didn't close the
+/// leak either: advanceAsync still produced one unreferenced,
+/// undisposed texture per frame.
+///
+/// Two paths, two ownership rules:
+///
+///  * Live (advance): frames are GC-owned. The previous frame is
+///    NEVER explicitly disposed, because VizBlitPainter may be
+///    blitting it on the current vsync. At display rate the GC keeps
+///    up fine; this was never the leaking path.
+///
+///  * Export (advanceAsync): frames are compositor-owned. The
+///    superseded frame is disposed the instant the new one is
+///    rasterized. Exactly two textures are ever alive (previous +
+///    current), so memory stays flat regardless of duration -- and
+///    the trail draws during export again, restoring the
+///    preview/export parity the README promises.
+///
+/// advanceAsync awaits Picture.toImage, which forces real GPU
+/// rasterization: the retained frame is a flat texture, never a
+/// nested DisplayList, so the trail draw cannot recurse ("Russian
+/// Doll" DisplayList problem).
 class VizCompositor {
   final int width;
   final int height;
 
   ui.Image? _frame;
+  bool _ownsFrame = false; // set by advanceAsync; guards explicit dispose
 
   VizCompositor({required this.width, required this.height});
 
   ui.Image? get image => _frame;
 
   void clear() {
-    // Safe clear. Lets the GC sweep memory.
+    if (_ownsFrame) _frame?.dispose();
     _frame = null;
+    _ownsFrame = false;
   }
 
-  ui.Picture _record(Visualization viz, VizContext ctx, bool isExport) {
+  ui.Picture _record(Visualization viz, VizContext ctx) {
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(
       recorder,
       Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
     );
 
-    // VRAM LEAK FIX: Skip drawing the heavy texture trail if we are exporting.
-    // This prevents Flutter from building an infinitely deep "Russian Doll" DisplayList.
-    if (!isExport) {
-      final double retention = ctx.settings.trailRetention.clamp(0.0, 0.995);
-      if (_frame != null && retention > 0.0) {
-        final Paint decayPaint = Paint()
-          ..color = const Color(0xFFFFFFFF).withOpacity(retention);
-        canvas.drawImage(_frame!, Offset.zero, decayPaint);
-      }
+    final double retention = ctx.settings.trailRetention.clamp(0.0, 0.995);
+    if (_frame != null && retention > 0.0) {
+      final Paint decayPaint = Paint()
+        ..color = const Color(0xFFFFFFFF).withOpacity(retention);
+      canvas.drawImage(_frame!, Offset.zero, decayPaint);
     }
 
     viz.render(canvas, ctx);
     return recorder.endRecording();
   }
 
-  /// Used by the live UI ticker. Runs synchronously to match monitor vsync.
-  ui.Image advance(Visualization viz, VizContext ctx, {bool isExport = false}) {
-    final ui.Picture picture = _record(viz, ctx, isExport);
+  /// Live path. Synchronous to match monitor vsync. Frames are
+  /// GC-owned: never disposed here, the painter may hold the old one.
+  /// [isExport] is retained for call-site compatibility and ignored.
+  ui.Image advance(Visualization viz, VizContext ctx,
+      {bool isExport = false}) {
+    final ui.Picture picture = _record(viz, ctx);
     final ui.Image next = picture.toImageSync(width, height);
     picture.dispose();
 
-    if (!isExport) {
-      _frame = next;
-    }
-    
+    _frame = next;
+    _ownsFrame = false;
     return next;
   }
 
-  /// Used by the offline exporter. Uses async rasterization to force the Flutter
-  /// engine to flatten the display list into a real GPU texture, preventing
-  /// catastrophic VRAM leaks from deeply nested Picture records.
-  Future<ui.Image> advanceAsync(Visualization viz, VizContext ctx, {bool isExport = false}) async {
-    final ui.Picture picture = _record(viz, ctx, isExport);
-    
-    // Await forces actual GPU rasterization, breaking the DisplayList chain.
+  /// Export path. Awaiting toImage forces GPU rasterization to a flat
+  /// texture. The superseded frame is disposed immediately -- this is
+  /// the VRAM fix. Returns a clone: the caller owns and disposes the
+  /// clone, the compositor owns and disposes the retained frame.
+  /// [isExport] is retained for call-site compatibility and ignored.
+  Future<ui.Image> advanceAsync(Visualization viz, VizContext ctx,
+      {bool isExport = false}) async {
+    final ui.Picture picture = _record(viz, ctx);
     final ui.Image next = await picture.toImage(width, height);
     picture.dispose();
 
-    if (!isExport) {
-      _frame = next;
-    }
-    
+    final ui.Image? prev = _frame;
+    _frame = next;
+    if (_ownsFrame) prev?.dispose();
+    _ownsFrame = true;
+
     return next.clone();
   }
 
   void dispose() {
-    // NEVER explicitly dispose _frame here! 
-    // The live UI might still be trying to paint it on the current vsync.
-    // Dart's Garbage Collector handles live UI frames safely and automatically.
+    // Only dispose frames this compositor owns (export path). Live
+    // frames stay GC-owned: the UI might still paint one this vsync.
+    if (_ownsFrame) _frame?.dispose();
     _frame = null;
+    _ownsFrame = false;
   }
 }
 
