@@ -10,6 +10,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -124,6 +125,8 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
   _Resolution _exportResolution = _resolutions[1]; // Default 1080p
   VideoExportFormat _exportFormat = VideoExportFormat.lumaMatte; // Default Format
   bool _allowNvenc = false; // GPU encoding opt-in; CPU is the known-good path
+  int _workerCount = math.max(1, (math.max(1, Platform.numberOfProcessors ~/ 2) * 0.75).floor()); // 75% of physical cores
+  bool _unlockMaxWorkers = false; // Lock out the 100% core saturation by default
 
   // --- Visualization platform ---
   late final List<Visualization> _visualizations;
@@ -393,6 +396,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
       width: _exportResolution.width,
       height: _exportResolution.height,
       format: _exportFormat,
+      workerCount: _workerCount,
       allowNvenc: _allowNvenc,
       cancelToken: token,
       onStatus: (status) {
@@ -433,9 +437,9 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
   // ---------------- SETTINGS DIALOG ----------------
 
   bool _presetMatches(_PhosphorPreset p) =>
-      _settings.outerColor.value == p.outer.value &&
-      _settings.midColor.value == p.mid.value &&
-      _settings.coreColor.value == p.core.value;
+      _settings.outerColor == p.outer.value &&
+      _settings.midColor == p.mid.value &&
+      _settings.coreColor == p.core.value;
 
   Future<void> _openSettings() async {
     await showDialog<void>(
@@ -445,6 +449,16 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
           void both(VoidCallback fn) {
             setLocal(fn);
             setState(() {});
+          }
+
+          int logicalThreads = Platform.numberOfProcessors;
+          int physicalCores = math.max(1, logicalThreads ~/ 2);
+          int recommendedMax = math.max(1, (physicalCores * 0.75).floor());
+          int currentMax = _unlockMaxWorkers ? logicalThreads : recommendedMax;
+
+          // Safety clamp in case properties drifted
+          if (_workerCount > currentMax) {
+            _workerCount = currentMax;
           }
 
           return AlertDialog(
@@ -513,6 +527,33 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                         ),
                       ],
                     ),
+                    const SizedBox(height: 8),
+                    Text('CPU Render Workers: $_workerCount (Max $currentMax)'),
+                    Slider(
+                      value: _workerCount.toDouble().clamp(1.0, currentMax.toDouble()),
+                      min: 1,
+                      max: currentMax.toDouble(),
+                      divisions: currentMax > 1 ? currentMax - 1 : 1,
+                      label: '$_workerCount',
+                      onChanged: (v) => both(() => _workerCount = v.round()),
+                    ),
+                    CheckboxListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      title: const Text('Unlock max workers (Not Recommended)'),
+                      subtitle: const Text(
+                        'Using 100% of cores can starve the OS and FFmpeg, causing stutters and slowing down the render.',
+                        style: TextStyle(fontSize: 11),
+                      ),
+                      value: _unlockMaxWorkers,
+                      onChanged: (v) => both(() {
+                        _unlockMaxWorkers = v ?? false;
+                        if (!_unlockMaxWorkers && _workerCount > recommendedMax) {
+                          _workerCount = recommendedMax;
+                        }
+                      }),
+                    ),
                     const SizedBox(height: 4),
                     CheckboxListTile(
                       contentPadding: EdgeInsets.zero,
@@ -570,12 +611,12 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                       children: [
                         const Text('Background Color: '),
                         const Spacer(),
-                        DropdownButton<Color>(
+                        DropdownButton<int>(
                           value: _settings.backgroundColor,
                           isDense: true,
                           items: const [
-                            DropdownMenuItem(value: Color(0xFF000000), child: Text('Black')),
-                            DropdownMenuItem(value: Color(0xFFFFFFFF), child: Text('White')),
+                            DropdownMenuItem(value: 0xFF000000, child: Text('Black')),
+                            DropdownMenuItem(value: 0xFFFFFFFF, child: Text('White')),
                           ],
                           onChanged: (v) => both(() {
                             if (v != null) _settings.backgroundColor = v;
@@ -619,9 +660,9 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                           selected: active,
                           avatar: CircleAvatar(backgroundColor: p.mid, radius: 8),
                           onSelected: (_) => both(() {
-                            _settings.outerColor = p.outer;
-                            _settings.midColor = p.mid;
-                            _settings.coreColor = p.core;
+                            _settings.outerColor = p.outer.value;
+                            _settings.midColor = p.mid.value;
+                            _settings.coreColor = p.core.value;
                           }),
                         );
                       }).toList(),
@@ -690,7 +731,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     painter: VizBlitPainter(
                       frame: _compositor?.image,
                       repaintKey: _frameCounter,
-                      backgroundColor: _settings.backgroundColor,
+                      backgroundColor: Color(_settings.backgroundColor),
                     ),
                   );
                 },

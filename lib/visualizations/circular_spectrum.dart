@@ -43,7 +43,7 @@ class CircularSpectrum implements Visualization {
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = (2.0 * s.strokeScale).clamp(1.0, 10.0)
       ..strokeCap = ui.StrokeCap.round
-      ..color = s.midColor;
+      ..color = ui.Color(s.midColor);
 
     if (s.glowBlurSigma > 0.0) {
       linePaint.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);

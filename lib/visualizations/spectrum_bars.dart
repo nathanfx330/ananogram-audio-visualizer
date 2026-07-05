@@ -41,12 +41,12 @@ class SpectrumBars implements Visualization {
     final double barW = (w - gap * (barCount - 1)) / barCount;
     final double maxBarH = h - 2 * WaveformStyle.edgeMargin;
 
-    final ui.Paint body = ui.Paint()..color = s.midColor;
+    final ui.Paint body = ui.Paint()..color = ui.Color(s.midColor);
     if (s.glowBlurSigma > 0.0) {
       body.maskFilter =
           ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);
     }
-    final ui.Paint cap = ui.Paint()..color = s.coreColor;
+    final ui.Paint cap = ui.Paint()..color = ui.Color(s.coreColor);
     final double capH =
         (WaveformStyle.midWidth * s.strokeScale).clamp(1.0, 12.0);
 

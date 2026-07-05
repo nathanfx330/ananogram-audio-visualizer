@@ -72,7 +72,7 @@ class BassHalo implements Visualization {
     final ui.Paint outer = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 6.0 * s.strokeScale
-      ..color = s.outerColor;
+      ..color = ui.Color(s.outerColor);
     if (s.glowBlurSigma > 0.0) {
       outer.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma * 2);
     }
@@ -80,7 +80,7 @@ class BassHalo implements Visualization {
     final ui.Paint core = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 2.0 * s.strokeScale
-      ..color = s.coreColor;
+      ..color = ui.Color(s.coreColor);
 
     canvas.drawPath(path, outer);
     canvas.drawPath(path, core);

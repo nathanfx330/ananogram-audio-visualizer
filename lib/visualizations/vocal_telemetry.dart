@@ -35,7 +35,7 @@ class VocalTelemetry implements Visualization {
     final ui.Paint gridPaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 1.0
-      ..color = s.outerColor.withOpacity(0.3);
+      ..color = ui.Color(s.outerColor).withOpacity(0.3);
 
     // Draw horizontal measurement lines
     final int hLines = 8;
@@ -106,7 +106,7 @@ class VocalTelemetry implements Visualization {
     // --- 3. DRAW ENVELOPE (Soft fill for volume footprint) ---
     final ui.Paint envelopePaint = ui.Paint()
       ..style = ui.PaintingStyle.fill
-      ..color = s.outerColor.withOpacity(0.2);
+      ..color = ui.Color(s.outerColor).withOpacity(0.2);
     canvas.drawPath(envelopePath, envelopePaint);
 
     // Mirror envelope for the bottom half
@@ -121,7 +121,7 @@ class VocalTelemetry implements Visualization {
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = (1.5 * s.strokeScale).clamp(1.0, 4.0)
       ..strokeJoin = ui.StrokeJoin.round
-      ..color = s.midColor;
+      ..color = ui.Color(s.midColor);
 
     if (s.glowBlurSigma > 0.0) {
       wavePaint.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);
@@ -132,7 +132,7 @@ class VocalTelemetry implements Visualization {
     final ui.Paint corePaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 1.0
-      ..color = s.coreColor;
+      ..color = ui.Color(s.coreColor);
     canvas.drawPath(wavePath, corePaint);
 
     // --- 5. DRAW PLAYHEAD (Current Time Indicator) ---
@@ -140,7 +140,7 @@ class VocalTelemetry implements Visualization {
     final ui.Paint playheadPaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 3.0
-      ..color = s.coreColor.withOpacity(0.5 + (_smoothMid * 0.5)); // Pulses with voice
+      ..color = ui.Color(s.coreColor).withOpacity(0.5 + (_smoothMid * 0.5)); // Pulses with voice
     if (s.glowBlurSigma > 0.0) {
       playheadPaint.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma * 2);
     }

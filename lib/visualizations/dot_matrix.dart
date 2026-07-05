@@ -37,14 +37,14 @@ class DotMatrixSpectrum implements Visualization {
     final double xGap = (w - (dotSize * columns)) / (columns + 1);
     final double yGap = (h - (dotSize * rows)) / (rows + 1);
 
-    final ui.Paint activePaint = ui.Paint()..color = s.coreColor;
+    final ui.Paint activePaint = ui.Paint()..color = ui.Color(s.coreColor);
     if (s.glowBlurSigma > 0.0) {
       activePaint.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);
     }
     
     // Dim paint for the "off" LEDs
     final ui.Paint inactivePaint = ui.Paint()
-      ..color = s.outerColor.withOpacity(0.15)
+      ..color = ui.Color(s.outerColor).withOpacity(0.15)
       ..style = ui.PaintingStyle.fill;
 
     for (int c = 0; c < columns; c++) {

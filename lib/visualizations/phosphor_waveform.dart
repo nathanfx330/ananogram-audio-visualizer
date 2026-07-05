@@ -78,7 +78,7 @@ class PhosphorWaveform implements Visualization {
       ..strokeWidth = WaveformStyle.outerWidth * scale
       ..strokeCap = ui.StrokeCap.round
       ..strokeJoin = ui.StrokeJoin.round
-      ..color = s.outerColor;
+      ..color = ui.Color(s.outerColor);
     if (s.glowBlurSigma > 0.0) {
       outer.maskFilter =
           ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);
@@ -89,14 +89,14 @@ class PhosphorWaveform implements Visualization {
       ..strokeWidth = WaveformStyle.midWidth * scale
       ..strokeCap = ui.StrokeCap.round
       ..strokeJoin = ui.StrokeJoin.round
-      ..color = s.midColor;
+      ..color = ui.Color(s.midColor);
 
     final ui.Paint core = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = WaveformStyle.coreWidth * scale
       ..strokeCap = ui.StrokeCap.round
       ..strokeJoin = ui.StrokeJoin.round
-      ..color = s.coreColor;
+      ..color = ui.Color(s.coreColor);
 
     canvas.drawPath(path, outer);
     canvas.drawPath(path, midP);

@@ -5,20 +5,48 @@
 // TWO RENDER PATHS:
 //
 //  * CPU raster (preferred): if the active plugin has a
-//    SoftVisualization port, the whole render+write loop runs on ONE
-//    plain worker isolate -- SoftCanvas software rasterization
-//    straight into blocking FIFO writes. No raster thread, no
-//    toImage, no readback, no writer handoff. RasterProbe proved
-//    concurrent Picture.toImage calls fully serialize on the raster
-//    thread (concurrent/serial 0.96, ~82 ms scheduling tax/call), so
-//    the ~30 ms/frame GPU dispatch cost cannot be pipelined away;
-//    rendering in software sidesteps it entirely. Backpressure is
-//    the blocking write itself. Cancellation: main kills FFmpeg, the
-//    pipe's read end closes, the worker's next write EPIPEs and it
-//    exits -- main reports cancelled, not failed.
+//    SoftVisualization port, the bake runs as a PARALLEL POOL of
+//    worker isolates (soft_bake_pool.dart) -- each renders a
+//    contiguous frame chunk in pure Dart via SoftCanvas straight into
+//    its own FIFO + ffmpeg, producing a lossless-alpha segment. The
+//    segments concat (stream-copy) into one intermediate; a single
+//    final ffmpeg pass then runs the format-specific alpha graph and
+//    muxes audio. RasterProbe proved concurrent Picture.toImage calls
+//    fully serialize on the raster thread (concurrent/serial 0.96,
+//    ~82 ms scheduling tax/call), so the GPU dispatch cost cannot be
+//    pipelined away; software render on N plain isolates sidesteps it
+//    AND scales across cores.
 //
-//  * GPU (fallback): unported plugins take the original
-//    FIFO + writer-isolate pipeline below, unchanged.
+//  * GPU (fallback): unported plugins take the original single-FIFO +
+//    writer-isolate pipeline below, unchanged.
+//
+// CPU PATH ARCHITECTURE (segments -> concat -> final pass):
+//
+// The parallel pool cannot share one ordered output stream without
+// stalling non-leading workers (see soft_bake_pool.dart header), so
+// each worker encodes an independent segment. That forces a choice
+// about WHERE the format-specific alpha work runs:
+//
+//   Segments are encoded LOSSLESS with alpha preserved (FFV1 in
+//   yuva444p). No unpremultiply, no matte extraction, no black
+//   composite, no ProRes conversion happens per-segment -- segments
+//   are a faithful, lossless carrier of the exact premultiplied RGBA
+//   the workers stamped. ALL format-specific alpha handling runs
+//   ONCE, in a single final pass, on the concatenated intermediate.
+//
+// This keeps the pool dumb (render -> lossless segment, nothing
+// format-aware) and confines every alpha decision to one place -- the
+// _finalPassArgs builder -- which runs the SAME filtergraphs the GPU
+// path uses inline, just relocated to the end of the CPU pipeline.
+// The cost is large temporary intermediates (lossless 4:4:4+alpha),
+// but they are transient and deleted after the final pass. Because
+// the alpha survives losslessly to the final pass, lumaMatte's matte
+// is generated there from the intermediate's own alpha plane -- no
+// second set of segments, no special-casing in the pool.
+//
+// Concat is the ffmpeg concat DEMUXER in stream-copy mode: every
+// segment is an independent FFV1 encode with identical parameters, so
+// the segments splice frame-exact with no re-encode.
 //
 // FIFO + Writer-Isolate Pipeline (GPU path):
 // Render frame -> Raw RGBA -> named FIFO -> FFmpeg.
@@ -63,10 +91,13 @@
 // ALPHA INTERPRETATION:
 // Both render paths produce PREMULTIPLIED RGBA: Flutter's rawRgba
 // readback is premultiplied by definition, and SoftCanvas composites
-// in premultiplied space to match it byte-for-byte in semantics.
-// FFmpeg and every downstream consumer (NLE alpha defaults,
+// in premultiplied space to match it byte-for-byte in semantics. On
+// the CPU path the premultiplied frames ride through the lossless
+// segments and concat untouched, reaching the final pass exactly as
+// stamped. FFmpeg and every downstream consumer (NLE alpha defaults,
 // luma-matte reconstruction math) assume STRAIGHT alpha unless told
-// otherwise. Each format handles the mismatch at the point of encode:
+// otherwise. Each format handles the mismatch at the point of encode
+// (GPU: inline; CPU: in the final pass):
 //
 //  * h264SolidBlack -- if the background is exactly black, premultiplied 
 //    is exactly "already composited over black", so dropping the alpha 
@@ -106,14 +137,19 @@
 // 10-bit 4:4:4 (ProRes) and for synthetic glows this is invisible;
 // it is the standard cost of every straight-alpha export.
 //
-// INSTRUMENTATION: per-stage millisecond totals are printed every
-// _timingReportInterval frames on both paths (tag [export] for GPU,
-// [export-cpu] for soft) and accumulated whole-run into the sidecar
-// "performance" block. On the soft path avg_readback_ms is 0.0 by
-// construction (no GPU readback exists) and avg_write_wait_ms is the
-// blocking FIFO write -- syscall plus encode backpressure. Wall time
-// stops when the last frame hits the pipe, before FFmpeg's
-// trailing-frame finalize.
+// INSTRUMENTATION: the GPU path prints per-stage millisecond totals
+// every _timingReportInterval frames (tag [export]) and accumulates
+// whole-run into the sidecar. The CPU pool returns aggregated
+// SoftBakeStats (pooled per-frame render + write, real parallel wall
+// time, parallel efficiency, replay cost, and a per-worker
+// breakdown). Both feed the sidecar "performance" block. On the CPU
+// path avg_readback_ms is 0.0 by construction (no GPU readback
+// exists) and avg_write_wait_ms is the pooled blocking FIFO write.
+// Wall time is the pool's parallel wall (first worker start to last
+// worker done), excluding concat + final pass, which are container/
+// encode bookkeeping rather than render throughput. The per-worker
+// breakdown is printed at bake end to expose stragglers and encode
+// starvation while tuning worker count.
 
 import 'dart:async';
 import 'dart:convert';
@@ -124,7 +160,7 @@ import 'dart:ui' as ui;
 
 import 'manifest.dart';
 import 'raster_probe.dart';
-import 'soft_raster.dart';
+import 'soft_bake_pool.dart';
 import 'soft_visualizations.dart';
 import 'visualization.dart';
 
@@ -223,157 +259,6 @@ void _fifoWriterMain((String, SendPort) setup) {
 }
 
 // ---------------------------------------------------------------------------
-// Soft bake worker isolate (CPU path)
-// ---------------------------------------------------------------------------
-
-/// Everything the CPU bake worker needs. Sent once at spawn. Audio
-/// crosses as TransferableTypedData: fromList copies, materialize
-/// moves -- the UI isolate's buffer stays intact, the worker pays no
-/// second copy.
-class _SoftBakeConfig {
-  final String fifoPath;
-  final SendPort reply;
-  final String vizName;
-  final TransferableTypedData audio;
-  final int sampleRate;
-  final int frameCount;
-  final int fps;
-  final int width;
-  final int height;
-  final double dampening;
-  final WaveformSettings settings;
-
-  _SoftBakeConfig({
-    required this.fifoPath,
-    required this.reply,
-    required this.vizName,
-    required this.audio,
-    required this.sampleRate,
-    required this.frameCount,
-    required this.fps,
-    required this.width,
-    required this.height,
-    required this.dampening,
-    required this.settings,
-  });
-}
-
-/// Entry point for the CPU bake worker.
-///
-/// Protocol (worker -> main, via reply):
-///   'ready'                                    FIFO opened (FFmpeg attached)
-///   ('progress', framesDone)                   throttled
-///   ('done', frames, renderMs, writeMs, wallS) all frames written
-///   'error:<msg>'                              any failure (EPIPE on
-///                                              cancel lands here)
-///
-/// No inbox: the loop is synchronous (blocking writes) and cannot
-/// service a port. Cancellation arrives as EPIPE when main kills
-/// FFmpeg.
-void _softBakeMain(_SoftBakeConfig cfg) {
-  final SendPort reply = cfg.reply;
-
-  RandomAccessFile? raf;
-  try {
-    raf = File(cfg.fifoPath).openSync(mode: FileMode.writeOnly);
-  } catch (e) {
-    reply.send('error:FIFO open failed: $e');
-    return;
-  }
-  reply.send('ready');
-
-  try {
-    final Float32List audio = cfg.audio.materialize().asFloat32List();
-
-    final SoftVisualization? viz = softVisualizationFor(cfg.vizName);
-    if (viz == null) {
-      // Registry disagreed between main and worker -- a bug, not a
-      // runtime condition. Fail loudly.
-      throw StateError('No soft implementation for "${cfg.vizName}".');
-    }
-    viz.reset();
-
-    final SoftCanvas canvas = SoftCanvas(cfg.width, cfg.height);
-    final double dt = 1.0 / cfg.fps;
-    // Same clamp VizCompositor._record applies to the trail draw.
-    final double retention =
-        cfg.settings.trailRetention.clamp(0.0, 0.995);
-
-    final Stopwatch sw = Stopwatch();
-    final Stopwatch wall = Stopwatch()..start();
-    double msRender = 0, msWrite = 0;
-    double totalRender = 0, totalWrite = 0;
-    int lastProgressMs = -FrameExporter._progressIntervalMs;
-
-    for (int i = 0; i < cfg.frameCount; i++) {
-      final VizContext ctx = VizContext(
-        audio: audio,
-        sampleRate: cfg.sampleRate,
-        t: i / cfg.fps,
-        frameIndex: i,
-        dt: dt,
-        width: cfg.width,
-        height: cfg.height,
-        dampening: cfg.dampening,
-        settings: cfg.settings,
-      );
-
-      // Decay-then-draw, mirroring VizCompositor._record's order.
-      sw..reset()..start();
-      canvas.decay(retention);
-      viz.render(canvas, ctx);
-      final double renderMs = sw.elapsedMicroseconds / 1000.0;
-      msRender += renderMs;
-      totalRender += renderMs;
-
-      // Blocking write IS the backpressure: the OS pipe parks this
-      // isolate when FFmpeg falls behind. The pipe copies the bytes,
-      // so mutating canvas.pixels next frame is safe.
-      sw..reset()..start();
-      raf.writeFromSync(canvas.pixels);
-      final double writeMs = sw.elapsedMicroseconds / 1000.0;
-      msWrite += writeMs;
-      totalWrite += writeMs;
-
-      final int done = i + 1;
-      final int nowMs = wall.elapsedMilliseconds;
-      if (nowMs - lastProgressMs >= FrameExporter._progressIntervalMs ||
-          done == cfg.frameCount) {
-        lastProgressMs = nowMs;
-        reply.send(('progress', done));
-      }
-
-      if (FrameExporter._timingReportInterval > 0 &&
-          done % FrameExporter._timingReportInterval == 0) {
-        final double n = FrameExporter._timingReportInterval.toDouble();
-        final double fpsNow =
-            done / (wall.elapsedMilliseconds / 1000.0);
-        print('[export-cpu] frame $done/${cfg.frameCount}  '
-            'render ${(msRender / n).toStringAsFixed(1)}ms  '
-            'write ${(msWrite / n).toStringAsFixed(1)}ms  '
-            '| ${fpsNow.toStringAsFixed(1)} fps '
-            '(${(fpsNow / cfg.fps).toStringAsFixed(2)}x realtime)');
-        msRender = 0;
-        msWrite = 0;
-      }
-    }
-
-    // Pipeline done: freeze the clock before closing (FFmpeg's
-    // trailing finalize is container bookkeeping, not throughput).
-    final double wallSec = wall.elapsedMicroseconds / 1e6;
-    raf.closeSync();
-    reply.send(('done', cfg.frameCount, totalRender, totalWrite, wallSec));
-  } catch (e) {
-    // EPIPE after a cancel/FFmpeg death lands here; main decides
-    // whether it was a cancel (token set) or a real failure.
-    try {
-      raf.closeSync();
-    } catch (_) {}
-    reply.send('error:$e');
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Exporter
 // ---------------------------------------------------------------------------
 
@@ -410,6 +295,12 @@ class FrameExporter {
 
   // Print stage timings every N frames (0 disables).
   static const int _timingReportInterval = 60;
+
+  // Per-segment FFV1 encoder threads. FFV1 slice threading is cheap
+  // but competes with the render isolates for cores; keep it low so
+  // the cores belong to render. 1 = no intra-segment threading; the
+  // parallelism is across segments, not within them.
+  static const String _ffv1Threads = '1';
 
   static bool? _nvencVerified;
 
@@ -460,6 +351,7 @@ class FrameExporter {
     required int width,
     required int height,
     required VideoExportFormat format,
+    required int workerCount,
     bool allowNvenc = false,
     void Function(int done, int total)? onProgress,
     void Function(String status)? onStatus,
@@ -486,6 +378,36 @@ class FrameExporter {
     final bool useNvenc = allowNvenc && await _nvencWorks();
     final String h264Codec = useNvenc ? 'h264_nvenc' : 'libx264';
     final String h264Preset = useNvenc ? _nvencPreset : _x264Preset;
+
+    // --- Route: CPU parallel pool if the plugin has a soft port ---
+    if (softVisualizationFor(viz.name) != null) {
+      return _exportSoftParallel(
+        vizName: viz.name,
+        audio: audio,
+        sampleRate: sampleRate,
+        durationSec: durationSec,
+        sourcePath: sourcePath,
+        dampening: dampening,
+        settings: settings,
+        fps: fps,
+        width: width,
+        height: height,
+        format: format,
+        frameCount: frameCount,
+        project: project,
+        workerCount: workerCount,
+        useNvenc: useNvenc,
+        h264Codec: h264Codec,
+        h264Preset: h264Preset,
+        onProgress: onProgress,
+        onStatus: onStatus,
+        cancelToken: cancelToken,
+      );
+    }
+
+    // ------------------------------------------------------------------
+    // GPU path (fallback for unported plugins)
+    // ------------------------------------------------------------------
 
     String actualOutputPath = '$exportDir/$project.mov';
     String? mattePath;
@@ -579,7 +501,7 @@ class FrameExporter {
         actualOutputPath = actualOutputPath.replaceAll(RegExp(r'\.mov$'), '.mp4');
         videoCodec = h264Codec;
 
-        final String hexBg = '#${(settings.backgroundColor.value & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+        final String hexBg = '#${(settings.backgroundColor & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
 
         if (hexBg == '#000000') {
           args.addAll([
@@ -612,37 +534,6 @@ class FrameExporter {
         }
         break;
     }
-
-    // --- Route: CPU raster if the plugin has a soft port ---
-    if (softVisualizationFor(viz.name) != null) {
-      return _exportSoft(
-        vizName: viz.name,
-        audio: audio,
-        sampleRate: sampleRate,
-        durationSec: durationSec,
-        sourcePath: sourcePath,
-        dampening: dampening,
-        settings: settings,
-        fps: fps,
-        width: width,
-        height: height,
-        format: format,
-        frameCount: frameCount,
-        project: project,
-        ffmpegArgs: args,
-        fifoPath: fifoPath,
-        actualOutputPath: actualOutputPath,
-        mattePath: mattePath,
-        videoCodec: videoCodec,
-        onProgress: onProgress,
-        onStatus: onStatus,
-        cancelToken: cancelToken,
-      );
-    }
-
-    // ------------------------------------------------------------------
-    // GPU path (fallback for unported plugins)
-    // ------------------------------------------------------------------
 
     // --- Spawn writer isolate (it blocks opening the FIFO) ---
     final ReceivePort fromWriter = ReceivePort();
@@ -930,10 +821,133 @@ class FrameExporter {
   }
 
   // ------------------------------------------------------------------
-  // CPU raster path
+  // CPU parallel path: pool -> segments -> concat -> final pass
   // ------------------------------------------------------------------
 
-  static Future<ExportResult> _exportSoft({
+  /// FFV1 segment args: raw rgba from the worker's FIFO in, one
+  /// lossless-alpha video-only segment out. No filtergraph, no audio,
+  /// no format-specific work -- segments are a faithful carrier of
+  /// the premultiplied RGBA the worker stamped. yuva444p keeps all
+  /// four channels lossless so the final pass can do straight-alpha
+  /// math correctly. Every segment uses identical settings, so the
+  /// concat demuxer stream-copies them frame-exact.
+  List<String> _segmentArgs(
+      String fifoPath, String segmentPath, int chunkFrames,
+      {required int fps, required int width, required int height}) {
+    return <String>[
+      '-y',
+      '-v', 'error',
+      '-nostats',
+      '-nostdin',
+      '-f', 'rawvideo',
+      '-pix_fmt', 'rgba',
+      '-s', '${width}x${height}',
+      '-framerate', '$fps',
+      '-i', fifoPath,
+      '-frames:v', '$chunkFrames',
+      '-c:v', 'ffv1',
+      '-level', '3',
+      '-pix_fmt', 'yuva444p',
+      '-threads', _ffv1Threads,
+      '-an',
+      segmentPath,
+    ];
+  }
+
+  /// Final-pass args: the concatenated lossless intermediate ([0:v],
+  /// premultiplied RGBA preserved) + the source audio ([1:a]) ->
+  /// the format-specific deliverable. These filtergraphs are the
+  /// SAME as the GPU path's inline graphs, relocated here to run once
+  /// on the whole stream.
+  List<String> _finalPassArgs({
+    required String intermediatePath,
+    required String sourcePath,
+    required String outputPath,
+    required String? mattePath,
+    required VideoExportFormat format,
+    required WaveformSettings settings,
+    required int width,
+    required int height,
+    required bool useNvenc,
+    required String h264Codec,
+    required String h264Preset,
+  }) {
+    final List<String> args = <String>[
+      '-y',
+      '-v', 'error',
+      '-nostats',
+      '-nostdin',
+      '-i', intermediatePath, // Input 0: lossless video (premultiplied)
+      '-i', sourcePath,       // Input 1: source audio
+    ];
+
+    switch (format) {
+      case VideoExportFormat.lumaMatte:
+        args.addAll([
+          '-filter_complex',
+          '[0:v]unpremultiply=inplace=1,format=rgba,split=2[fg][fa]; '
+              '[fg]format=yuv420p[color]; '
+              '[fa]alphaextract,format=yuv420p[matte]',
+          '-map', '[color]', '-map', '1:a',
+          '-c:v', h264Codec, '-preset', h264Preset,
+          if (!useNvenc) ...['-crf', '18', '-threads', '0'],
+          if (useNvenc) ...['-cq', _nvencCq],
+          '-c:a', 'aac', '-b:a', '320k', '-shortest',
+          outputPath,
+          '-map', '[matte]',
+          '-c:v', h264Codec, '-preset', h264Preset,
+          if (!useNvenc) ...['-crf', '18', '-threads', '0'],
+          if (useNvenc) ...['-cq', _nvencCq],
+          '-an', mattePath!,
+        ]);
+        break;
+
+      case VideoExportFormat.proresAlpha:
+        args.addAll([
+          '-filter_complex',
+          '[0:v]unpremultiply=inplace=1,format=rgba[straight]',
+          '-map', '[straight]', '-map', '1:a',
+          '-c:v', 'prores_ks', '-profile:v', '4444',
+          '-qscale:v', '11', '-pix_fmt', 'yuva444p10le',
+          '-threads', '0', '-c:a', 'pcm_s16le', '-shortest',
+          outputPath,
+        ]);
+        break;
+
+      case VideoExportFormat.h264SolidBlack:
+        final String hexBg =
+            '#${(settings.backgroundColor & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+        if (hexBg == '#000000') {
+          args.addAll([
+            '-filter_complex',
+            '[0:v]format=yuv420p[color]',
+            '-map', '[color]', '-map', '1:a',
+            '-c:v', h264Codec, '-preset', h264Preset,
+            if (!useNvenc) ...['-crf', '18', '-threads', '0'],
+            if (useNvenc) ...['-cq', _nvencCq],
+            '-c:a', 'aac', '-b:a', '320k', '-shortest',
+            outputPath,
+          ]);
+        } else {
+          args.addAll([
+            '-filter_complex',
+            'color=c=$hexBg:s=${width}x${height}[bg]; '
+            '[0:v]unpremultiply=inplace=1,format=rgba[fg]; '
+            '[bg][fg]overlay=format=yuv420p[color]',
+            '-map', '[color]', '-map', '1:a',
+            '-c:v', h264Codec, '-preset', h264Preset,
+            if (!useNvenc) ...['-crf', '18', '-threads', '0'],
+            if (useNvenc) ...['-cq', _nvencCq],
+            '-c:a', 'aac', '-b:a', '320k', '-shortest',
+            outputPath,
+          ]);
+        }
+        break;
+    }
+    return args;
+  }
+
+  static Future<ExportResult> _exportSoftParallel({
     required String vizName,
     required Float32List audio,
     required int sampleRate,
@@ -947,175 +961,241 @@ class FrameExporter {
     required VideoExportFormat format,
     required int frameCount,
     required String project,
-    required List<String> ffmpegArgs,
-    required String fifoPath,
-    required String actualOutputPath,
-    required String? mattePath,
-    required String videoCodec,
+    required int workerCount,
+    required bool useNvenc,
+    required String h264Codec,
+    required String h264Preset,
     void Function(int done, int total)? onProgress,
     void Function(String status)? onStatus,
     ExportCancelToken? cancelToken,
   }) async {
-    final ReceivePort fromWorker = ReceivePort();
-    final Completer<void> readyC = Completer<void>();
-    final Completer<void> doneC = Completer<void>();
-    String? workerError;
-    int framesDone = 0;
-    int framesRendered = 0;
-    double totalRender = 0, totalWrite = 0, pipelineWallSec = 0;
+    // Resolve final output path + matte path per format (same rules
+    // as the GPU path's inline replaceAll chain).
+    String actualOutputPath = '$exportDir/$project.mov';
+    String? mattePath;
+    String videoCodec;
+    switch (format) {
+      case VideoExportFormat.lumaMatte:
+        actualOutputPath =
+            actualOutputPath.replaceAll(RegExp(r'\.mov$'), '.mp4');
+        mattePath = actualOutputPath.replaceAll('.mp4', '_matte.mp4');
+        videoCodec = h264Codec;
+        break;
+      case VideoExportFormat.proresAlpha:
+        actualOutputPath =
+            actualOutputPath.replaceAll(RegExp(r'\.mp4$'), '.mov');
+        videoCodec = 'prores_ks';
+        break;
+      case VideoExportFormat.h264SolidBlack:
+        actualOutputPath =
+            actualOutputPath.replaceAll(RegExp(r'\.mov$'), '.mp4');
+        videoCodec = h264Codec;
+        break;
+    }
 
-    fromWorker.listen((dynamic msg) {
-      if (msg == 'ready') {
-        if (!readyC.isCompleted) readyC.complete();
-      } else if (msg is String && msg.startsWith('error:')) {
-        workerError = msg.substring(6);
-        if (!readyC.isCompleted) readyC.complete();
-        if (!doneC.isCompleted) doneC.complete();
-      } else if (msg is (String, int) && msg.$1 == 'progress') {
-        framesDone = msg.$2;
-        onProgress?.call(framesDone, frameCount);
-      } else if (msg is (String, int, double, double, double) &&
-          msg.$1 == 'done') {
-        framesRendered = msg.$2;
-        totalRender = msg.$3;
-        totalWrite = msg.$4;
-        pipelineWallSec = msg.$5;
-        if (!doneC.isCompleted) doneC.complete();
-      }
-    });
+    final String tag = '$pid';
+    final String intermediatePath =
+        '$exportDir/.ananogram_softconcat_$tag.mkv';
+    final String concatListPath =
+        '$exportDir/.ananogram_softlist_$tag.txt';
 
-    final Isolate worker = await Isolate.spawn(
-      _softBakeMain,
-      _SoftBakeConfig(
-        fifoPath: fifoPath,
-        reply: fromWorker.sendPort,
-        vizName: vizName,
-        audio: TransferableTypedData.fromList([audio]),
-        sampleRate: sampleRate,
-        frameCount: frameCount,
-        fps: fps,
-        width: width,
-        height: height,
-        dampening: dampening,
-        settings: settings,
-      ),
+    // Instance needed only for the two arg-builder methods (they use
+    // no instance state; a throwaway keeps them as instance methods
+    // without making the whole class static-only).
+    final FrameExporter self = FrameExporter._();
+
+    final SoftBakePool pool = SoftBakePool(
+      width: width,
+      height: height,
+      fps: fps,
+      totalFrames: frameCount,
+      vizName: vizName,
+      audio: audio,
+      sampleRate: sampleRate,
+      dampening: dampening,
+      settings: settings,
+      workDir: exportDir,
+      tag: tag,
+      workerCount: workerCount,
+      progressIntervalMs: _progressIntervalMs,
     );
 
-    // --- Start FFmpeg (opens the FIFO read end, releasing the worker) ---
-    final Process proc = await Process.start('ffmpeg', ffmpegArgs);
-
-    final Completer<int> exitC = Completer<int>();
-    unawaited(proc.exitCode.then(exitC.complete));
-
-    final StringBuffer errBuf = StringBuffer();
-    proc.stderr.transform(utf8.decoder).listen(errBuf.write);
-
-    Future<void> teardown() async {
+    void deleteQuietly(String path) {
       try {
-        proc.kill(ProcessSignal.sigterm);
-      } catch (_) {}
-      // Release the worker if it's still blocked opening the FIFO.
-      if (!readyC.isCompleted) {
-        try {
-          final RandomAccessFile r =
-              File(fifoPath).openSync(mode: FileMode.read);
-          r.closeSync();
-        } catch (_) {}
-      }
-      worker.kill(priority: Isolate.immediate);
-      fromWorker.close();
-      try {
-        final File f = File(fifoPath);
+        final File f = File(path);
         if (f.existsSync()) f.deleteSync();
       } catch (_) {}
     }
 
-    onStatus?.call('Rendering & Baking Video (CPU)...');
+    // --- Phase A: parallel render -> N lossless segments ---
+    final SoftBakeResult bake = await pool.run(
+      buildSegmentArgs: (fifo, seg, chunkFrames) => self._segmentArgs(
+        fifo, seg, chunkFrames,
+        fps: fps, width: width, height: height,
+      ),
+      isCancelled: () => cancelToken?.isCancelled ?? false,
+      onProgress: onProgress,
+      onStatus: onStatus,
+    );
 
-    try {
-      await readyC.future;
-      if (workerError != null) {
-        throw Exception('Bake worker failed to attach: $workerError');
-      }
-
-      // The worker owns the loop; main just relays progress and polls
-      // for cancellation. Cancel = kill FFmpeg; the worker's blocked
-      // write EPIPEs and it exits on its own.
-      while (!doneC.isCompleted) {
-        if (cancelToken?.isCancelled ?? false) {
-          await teardown();
-          return ExportResult(
-            success: false,
-            cancelled: true,
-            framesWritten: framesDone,
-            outputPath: actualOutputPath,
-          );
-        }
-        await Future.delayed(const Duration(milliseconds: 100));
-      }
-
-      if (workerError != null) {
-        // If the token was set, the EPIPE is our own cancel arriving
-        // back -- but the cancel branch above returns first in every
-        // ordinary interleaving. Reaching here with an error means a
-        // real failure (FFmpeg died, encode error, worker crash).
-        throw Exception(
-            'Bake worker failed: $workerError\n${errBuf.toString().trim()}');
-      }
-
-      onStatus?.call('Finalizing File...');
-
-      while (!exitC.isCompleted) {
-        if (cancelToken?.isCancelled ?? false) {
-          await teardown();
-          return ExportResult(
-            success: false,
-            cancelled: true,
-            framesWritten: framesDone,
-            outputPath: actualOutputPath,
-          );
-        }
-        await Future.delayed(const Duration(milliseconds: 100));
-      }
-
-      final int exitCode = await exitC.future;
-      if (exitCode != 0) {
-        throw Exception(
-            'FFmpeg failed with code $exitCode\n${errBuf.toString().trim()}');
-      }
-
-      onProgress?.call(frameCount, frameCount);
-    } catch (e) {
-      print('Export Error: $e');
-      await teardown();
+    if (!bake.success) {
+      // Pool already cleaned its own segments/FIFOs on failure/cancel.
       return ExportResult(
         success: false,
-        cancelled: false,
-        framesWritten: framesDone,
+        cancelled: bake.cancelled,
+        framesWritten: bake.framesWritten,
         outputPath: actualOutputPath,
+        error: bake.error,
+      );
+    }
+
+    // From here segments exist and are ours to concat then delete.
+    void cleanupSegments() {
+      for (final String p in bake.segmentPaths) {
+        deleteQuietly(p);
+      }
+    }
+
+    try {
+      // --- Phase B: concat segments (stream copy) -> intermediate ---
+      onStatus?.call('Joining Segments...');
+      final StringBuffer listBuf = StringBuffer();
+      for (final String seg in bake.segmentPaths) {
+        // concat demuxer needs absolute paths, single-quoted.
+        final String abs = File(seg).absolute.path;
+        listBuf.writeln("file '$abs'");
+      }
+      File(concatListPath).writeAsStringSync(listBuf.toString());
+
+      if (cancelToken?.isCancelled ?? false) {
+        cleanupSegments();
+        deleteQuietly(concatListPath);
+        return ExportResult(
+          success: false, cancelled: true,
+          framesWritten: bake.framesWritten, outputPath: actualOutputPath,
+        );
+      }
+
+      final ProcessResult concat = await Process.run('ffmpeg', <String>[
+        '-y', '-v', 'error', '-nostdin',
+        '-f', 'concat', '-safe', '0',
+        '-i', File(concatListPath).absolute.path,
+        '-c', 'copy',
+        intermediatePath,
+      ]);
+      if (concat.exitCode != 0) {
+        cleanupSegments();
+        deleteQuietly(concatListPath);
+        deleteQuietly(intermediatePath);
+        return ExportResult(
+          success: false, cancelled: false,
+          framesWritten: bake.framesWritten, outputPath: actualOutputPath,
+          error: 'Segment concat failed: ${concat.stderr}',
+        );
+      }
+
+      // Segments consumed; drop them and the list now.
+      cleanupSegments();
+      deleteQuietly(concatListPath);
+
+      if (cancelToken?.isCancelled ?? false) {
+        deleteQuietly(intermediatePath);
+        return ExportResult(
+          success: false, cancelled: true,
+          framesWritten: bake.framesWritten, outputPath: actualOutputPath,
+        );
+      }
+
+      // --- Phase C: final pass (alpha graph + audio mux) ---
+      onStatus?.call('Finalizing File...');
+      final List<String> finalArgs = self._finalPassArgs(
+        intermediatePath: intermediatePath,
+        sourcePath: sourcePath,
+        outputPath: actualOutputPath,
+        mattePath: mattePath,
+        format: format,
+        settings: settings,
+        width: width,
+        height: height,
+        useNvenc: useNvenc,
+        h264Codec: h264Codec,
+        h264Preset: h264Preset,
+      );
+      final ProcessResult finalPass =
+          await Process.run('ffmpeg', finalArgs);
+      deleteQuietly(intermediatePath);
+
+      if (finalPass.exitCode != 0) {
+        return ExportResult(
+          success: false, cancelled: false,
+          framesWritten: bake.framesWritten, outputPath: actualOutputPath,
+          error: 'Final pass failed: ${finalPass.stderr}',
+        );
+      }
+    } catch (e) {
+      cleanupSegments();
+      deleteQuietly(concatListPath);
+      deleteQuietly(intermediatePath);
+      return ExportResult(
+        success: false, cancelled: false,
+        framesWritten: bake.framesWritten, outputPath: actualOutputPath,
         error: e.toString(),
       );
     }
 
-    // Success path cleanup: worker exited after 'done'; FFmpeg exited.
-    fromWorker.close();
-    try {
-      final File f = File(fifoPath);
-      if (f.existsSync()) f.deleteSync();
-    } catch (_) {}
+    onProgress?.call(frameCount, frameCount);
 
+    // --- Sidecar: renderer=cpu, pool stats -> performance block ---
     ExportPerformance? performance;
-    if (framesRendered > 0 && pipelineWallSec > 0) {
-      final double n = framesRendered.toDouble();
-      final double exportFps = framesRendered / pipelineWallSec;
+    final SoftBakeStats? st = bake.stats;
+    if (st != null && st.framesRendered > 0 && st.wallSec > 0) {
+      final double exportFps = st.framesRendered / st.wallSec;
       performance = ExportPerformance(
-        exportWallSec: pipelineWallSec,
+        exportWallSec: st.wallSec,
         exportFps: exportFps,
         realtimeFactor: exportFps / fps,
-        avgRenderMs: totalRender / n,
+        avgRenderMs: st.avgRenderMs,
         avgReadbackMs: 0.0, // no GPU readback exists on this path
-        avgWriteWaitMs: totalWrite / n,
+        avgWriteWaitMs: st.avgWriteWaitMs,
       );
+
+      // Summary line: the headline throughput plus the two tuning
+      // signals -- parallel efficiency (idle-core detector) and the
+      // worst replay (straggler tax).
+      print('[export-cpu] pool: ${st.workerCount} workers, '
+          '${st.framesRendered} frames, '
+          '${st.wallSec.toStringAsFixed(2)}s wall, '
+          '${exportFps.toStringAsFixed(1)} fps '
+          '(${(exportFps / fps).toStringAsFixed(2)}x realtime)  '
+          '| eff ${(st.parallelEfficiency * 100).toStringAsFixed(0)}%  '
+          'replay avg ${st.avgReplayMs.toStringAsFixed(0)}ms '
+          'max ${st.maxReplayMs.toStringAsFixed(0)}ms');
+      print('[export-cpu]   pooled per-frame: '
+          'render ${st.avgRenderMs.toStringAsFixed(1)}ms  '
+          'write ${st.avgWriteWaitMs.toStringAsFixed(1)}ms');
+
+      // Per-worker breakdown: one line each so a straggler (long wall,
+      // or replay eating its time) or a starved worker (high write) is
+      // immediately visible while tuning worker count. renderMs/writeMs
+      // are chunk totals; per-frame divides by that worker's frames.
+      final int nWorkers = st.perWorkerWallSec.length;
+      final int framesPerWorker =
+          nWorkers > 0 ? (st.framesRendered / nWorkers).round() : 0;
+      for (int w = 0; w < nWorkers; w++) {
+        final double wallS = st.perWorkerWallSec[w];
+        final double rMs = st.perWorkerRenderMs[w];
+        final double wMs = st.perWorkerWriteMs[w];
+        final double repMs = st.perWorkerReplayMs[w];
+        final double perFrameR =
+            framesPerWorker > 0 ? rMs / framesPerWorker : 0.0;
+        final double perFrameW =
+            framesPerWorker > 0 ? wMs / framesPerWorker : 0.0;
+        print('[export-cpu]   worker $w: '
+            'wall ${wallS.toStringAsFixed(2)}s  '
+            'render ${perFrameR.toStringAsFixed(1)}ms/f  '
+            'write ${perFrameW.toStringAsFixed(1)}ms/f  '
+            'replay ${repMs.toStringAsFixed(0)}ms');
+      }
     }
 
     final ExportRecord record = ExportRecord(
@@ -1129,7 +1209,7 @@ class FrameExporter {
       videoCodec: videoCodec,
       nvencUsed: videoCodec == 'h264_nvenc',
       fps: fps,
-      frameCount: framesRendered,
+      frameCount: bake.framesWritten,
       width: width,
       height: height,
       dampening: dampening,
@@ -1142,8 +1222,13 @@ class FrameExporter {
     return ExportResult(
       success: true,
       cancelled: false,
-      framesWritten: framesRendered,
+      framesWritten: bake.framesWritten,
       outputPath: actualOutputPath,
     );
   }
+
+  /// Private ctor: the class is otherwise all-static, but the two
+  /// final-pass/segment arg builders are instance methods (no state);
+  /// _exportSoftParallel spins up one throwaway to call them.
+  FrameExporter._();
 }

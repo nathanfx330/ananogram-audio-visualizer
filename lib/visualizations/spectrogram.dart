@@ -113,7 +113,7 @@ class VoiceprintSpectrogram implements Visualization {
     final ui.Paint playheadPaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = 2.0
-      ..color = s.coreColor.withOpacity(0.8);
+      ..color = ui.Color(s.coreColor).withOpacity(0.8);
       
     if (s.glowBlurSigma > 0.0) {
       playheadPaint.maskFilter = ui.MaskFilter.blur(ui.BlurStyle.normal, s.glowBlurSigma);
@@ -126,11 +126,11 @@ class VoiceprintSpectrogram implements Visualization {
   /// Transparent -> Outer Color -> Mid Color -> Core Color
   ui.Color _mapValueToColor(double v, WaveformSettings s) {
     if (v < 0.33) {
-      return ui.Color.lerp(const ui.Color(0x00000000), s.outerColor, v / 0.33)!;
+      return ui.Color.lerp(const ui.Color(0x00000000), ui.Color(s.outerColor), v / 0.33)!;
     } else if (v < 0.66) {
-      return ui.Color.lerp(s.outerColor, s.midColor, (v - 0.33) / 0.33)!;
+      return ui.Color.lerp(ui.Color(s.outerColor), ui.Color(s.midColor), (v - 0.33) / 0.33)!;
     } else {
-      return ui.Color.lerp(s.midColor, s.coreColor, (v - 0.66) / 0.34)!;
+      return ui.Color.lerp(ui.Color(s.midColor), ui.Color(s.coreColor), (v - 0.66) / 0.34)!;
     }
   }
 }

@@ -58,11 +58,11 @@ class RidgePlotSpectrum implements Visualization {
     final double maxSpike = lineSpacing * 8.0;
 
     // Use the dynamic background color to hide lines behind it properly
-    final ui.Paint fillPaint = ui.Paint()..color = s.backgroundColor; 
+    final ui.Paint fillPaint = ui.Paint()..color = ui.Color(s.backgroundColor); 
     final ui.Paint strokePaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = (1.5 * s.strokeScale).clamp(1.0, 5.0)
-      ..color = s.midColor;
+      ..color = ui.Color(s.midColor);
 
     for (int i = _history.length - 1; i >= 0; i--) {
       final List<double> lineData = _history[i];
