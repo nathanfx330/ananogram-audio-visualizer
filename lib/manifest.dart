@@ -3,12 +3,20 @@
 // Per-export bake record. Written as a JSON sidecar next to each
 // exported video (foo.mov -> foo.mov.json), recording everything
 // needed to reproduce the bake exactly: source, visualization,
-// format/codec, geometry, and the full WaveformSettings style block.
+// renderer, format/codec, geometry, and the full WaveformSettings
+// style block.
 //
 // Also records whole-run pipeline performance (ExportPerformance):
 // the per-stage numbers the exporter prints to the terminal during
 // debug runs die in stdout on a compiled binary, so the sidecar is
 // where a release build reports its true speed vs realtime.
+//
+// SCHEMA v4: adds "renderer" ("cpu" | "gpu") -- which raster path
+// produced the frames. Required, not optional: every bake has a
+// renderer, and an absent field would be ambiguous between "GPU"
+// and "written by a pre-v4 build". Performance-block semantics
+// differ per renderer (see ExportPerformance docs), so the field is
+// also the key to reading those numbers correctly.
 //
 // The old export_manifest.json / merge.py schema is gone: the raw
 // pixel pipeline never writes PNG frame sequences, so there is
@@ -22,14 +30,22 @@ import 'dart:io';
 /// terminal timing report, aggregated across every frame instead of
 /// per-60-frame windows. All averages are per-frame milliseconds.
 ///
-/// Stage semantics (matching frame_exporter.dart instrumentation):
-///   render   -- advanceAsync: GPU rasterization round trip
-///   readback -- residual toByteData await AFTER overlapping with
-///               the next render (near zero when fully hidden)
+/// Stage semantics depend on the record's renderer:
+///
+/// renderer == "gpu" (frame_exporter.dart GPU path):
+///   render     -- advanceAsync: GPU rasterization round trip
+///   readback   -- residual toByteData await AFTER overlapping with
+///                 the next render (near zero when fully hidden)
 ///   write_wait -- backpressure: waiting for a writer-isolate slot
-///               (FFmpeg encode falling behind shows up here)
+///                 (FFmpeg encode falling behind shows up here)
+///
+/// renderer == "cpu" (soft raster path):
+///   render     -- SoftCanvas decay + plugin render, pure CPU cost
+///   readback   -- always 0.0: no GPU readback exists on this path
+///   write_wait -- the blocking FIFO write: syscall plus encode
+///                 backpressure (FFmpeg falling behind shows up here)
 class ExportPerformance {
-  final double exportWallSec;    // total wall clock, first frame to last ack
+  final double exportWallSec;    // total wall clock, first frame to last write/ack
   final double exportFps;        // frames rendered / wall sec
   final double realtimeFactor;   // exportFps / target fps (>1 = faster than realtime)
   final double avgRenderMs;
@@ -67,6 +83,7 @@ class ExportRecord {
   final String? mattePath;       // absolute path to the matte pass
                                  // (lumaMatte format only, else null)
   final String visualization;    // Visualization.name
+  final String renderer;         // "cpu" | "gpu" -- which raster path
   final String format;           // VideoExportFormat name
   final String videoCodec;       // e.g. h264_nvenc / libx264 / prores_ks
   final bool nvencUsed;
@@ -86,6 +103,7 @@ class ExportRecord {
     required this.outputPath,
     this.mattePath,
     required this.visualization,
+    required this.renderer,
     required this.format,
     required this.videoCodec,
     required this.nvencUsed,
@@ -101,13 +119,14 @@ class ExportRecord {
   }) : createdUtc = createdUtc ?? DateTime.now().toUtc();
 
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'ananogram_export': 3,
+        'ananogram_export': 4,
         'project': project,
         'created_utc': createdUtc.toIso8601String(),
         'source_path': sourcePath,
         'output_path': outputPath,
         if (mattePath != null) 'matte_path': mattePath,
         'visualization': visualization,
+        'renderer': renderer,
         'format': format,
         'video_codec': videoCodec,
         'nvenc_used': nvencUsed,

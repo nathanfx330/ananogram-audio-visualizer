@@ -21,7 +21,9 @@ import 'visualizations/circular_spectrum.dart';
 import 'visualizations/dot_matrix.dart';
 import 'visualizations/phosphor_waveform.dart';
 import 'visualizations/ridge_plot.dart';
+import 'visualizations/spectrogram.dart';
 import 'visualizations/spectrum_bars.dart';
+import 'visualizations/vocal_telemetry.dart';
 
 /// User-adjustable style. Mutable; the settings dialog edits it in
 /// place. Plugins interpret these however makes sense for them
@@ -42,6 +44,10 @@ class WaveformSettings {
   Color outerColor;
   Color midColor;
   Color coreColor;
+  
+  /// The color composited behind the visualization in live preview
+  /// and solid-background exports. Does not affect transparent exports.
+  Color backgroundColor;
 
   WaveformSettings({
     this.windowDuration = 0.08,
@@ -51,6 +57,7 @@ class WaveformSettings {
     this.outerColor = const Color(0xFF1EA01E),
     this.midColor = const Color(0xFF32FF32),
     this.coreColor = const Color(0xFFC8FFC8),
+    this.backgroundColor = const Color(0xFF000000),
   });
 
   factory WaveformSettings.defaults() => WaveformSettings();
@@ -64,6 +71,7 @@ class WaveformSettings {
     outerColor = d.outerColor;
     midColor = d.midColor;
     coreColor = d.coreColor;
+    backgroundColor = d.backgroundColor;
   }
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -74,6 +82,7 @@ class WaveformSettings {
         'outer_color': _hex(outerColor),
         'mid_color': _hex(midColor),
         'core_color': _hex(coreColor),
+        'background_color': _hex(backgroundColor),
       };
 
   static String _hex(Color c) =>
@@ -282,4 +291,6 @@ List<Visualization> buildVisualizations() => <Visualization>[
       RidgePlotSpectrum(),
       DotMatrixSpectrum(),
       BassHalo(),
+      VocalTelemetry(),
+      VoiceprintSpectrogram(),
     ];

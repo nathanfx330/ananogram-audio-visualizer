@@ -66,6 +66,7 @@ const List<_PhosphorPreset> _phosphorPresets = [
   _PhosphorPreset('Cyan', Color(0xFF14828C), Color(0xFF28DCFF), Color(0xFFC8F5FF)),
   _PhosphorPreset('Magenta', Color(0xFF8C1478), Color(0xFFFF3CDC), Color(0xFFFFC8F0)),
   _PhosphorPreset('White', Color(0xFF787878), Color(0xFFE6E6E6), Color(0xFFFFFFFF)),
+  _PhosphorPreset('Forensic (Dark Ink)', Color(0xFFDDDDDD), Color(0xFF888888), Color(0xFF222222)),
 ];
 
 // Helper classes for export settings dropdowns
@@ -565,6 +566,24 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     // --- Glow / trail ---
                     const Text('Style & Glow', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
                     const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Text('Background Color: '),
+                        const Spacer(),
+                        DropdownButton<Color>(
+                          value: _settings.backgroundColor,
+                          isDense: true,
+                          items: const [
+                            DropdownMenuItem(value: Color(0xFF000000), child: Text('Black')),
+                            DropdownMenuItem(value: Color(0xFFFFFFFF), child: Text('White')),
+                          ],
+                          onChanged: (v) => both(() {
+                            if (v != null) _settings.backgroundColor = v;
+                          }),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
                     Text('Trail Persistence: ${(_settings.trailRetention * 100).round()}%'),
                     Slider(
                       value: _settings.trailRetention,
@@ -671,6 +690,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     painter: VizBlitPainter(
                       frame: _compositor?.image,
                       repaintKey: _frameCounter,
+                      backgroundColor: _settings.backgroundColor,
                     ),
                   );
                 },

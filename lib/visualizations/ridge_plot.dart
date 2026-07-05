@@ -57,7 +57,8 @@ class RidgePlotSpectrum implements Visualization {
     final double lineSpacing = h / (historySize + 10);
     final double maxSpike = lineSpacing * 8.0;
 
-    final ui.Paint fillPaint = ui.Paint()..color = const ui.Color(0xFF000000); // Black to hide lines behind it
+    // Use the dynamic background color to hide lines behind it properly
+    final ui.Paint fillPaint = ui.Paint()..color = s.backgroundColor; 
     final ui.Paint strokePaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = (1.5 * s.strokeScale).clamp(1.0, 5.0)
