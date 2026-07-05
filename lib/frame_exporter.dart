@@ -21,7 +21,7 @@
 // writer when FFmpeg falls behind, and the render loop keeps at most
 // _maxFramesInFlight un-acked frames, so RAM stays bounded.
 //
-// RASTER-THREAD SCHEDULING (this revision):
+// RASTER-THREAD SCHEDULING:
 // After the pipe fix, profiling showed render at ~44 ms/frame at 720p
 // -- far beyond actual raster work. Two causes addressed here:
 //
@@ -38,19 +38,70 @@
 //     kicked off un-awaited, frame N+1 renders on top of it, and N's
 //     bytes are awaited after. The readback cost hides under render.
 //
-// PREMULTIPLIED ALPHA (why there is no overlay-on-black filter):
-// Flutter's rawRgba readback is premultiplied: every color channel is
-// already scaled by its alpha. "Composite over black" is therefore a
-// no-op -- just drop the alpha channel (format=yuv420p). The old
-// color-source + overlay graph was wrong: overlay assumes straight
-// alpha, so premultiplied pixels got multiplied by alpha twice,
-// darkening every semi-transparent pixel (the entire glow falloff)
-// versus the preview.
+// RASTER PROBE (diagnostic, off by default): render still costs
+// ~30 ms/frame at 720p AND 1080p -- near-identical at 2.25x the
+// pixels, i.e. dispatch overhead, not raster work. _runRasterProbe
+// runs RasterProbe once at export start to answer whether concurrent
+// Picture.toImage calls overlap on the raster thread (pipelining the
+// export loop would pay) or serialize (CPU raster path is the only
+// real fix). Flip the flag, run one export, read the report, flip it
+// back.
 //
-// Instrumented: per-stage millisecond totals (render / readback /
+// ALPHA INTERPRETATION:
+// Flutter's rawRgba readback is PREMULTIPLIED: every color channel is
+// already scaled by its alpha. FFmpeg and every downstream consumer
+// (NLE alpha defaults, luma-matte reconstruction math) assume STRAIGHT
+// alpha unless told otherwise. Each format handles the mismatch at the
+// point of encode:
+//
+//  * h264SolidBlack -- premultiplied is exactly "already composited
+//    over black", so dropping the alpha plane (format=yuv420p) IS the
+//    black composite. No conversion. (The old color-source + overlay
+//    graph was wrong for the opposite reason: overlay assumes straight
+//    alpha, so premultiplied pixels got alpha applied twice, darkening
+//    the entire glow falloff.)
+//
+//  * proresAlpha -- ProRes 4444 alpha is interpreted as straight by
+//    default in every NLE/compositor. Encoding premultiplied pixels
+//    untagged bakes a one-stop darkening into every glow edge unless
+//    the artist manually reinterprets the footage as premultiplied/
+//    matted-black. The graph runs unpremultiply=inplace=1 before the
+//    encoder, so the file matches the default interpretation: drop it
+//    in the comp, alpha just works.
+//
+//  * lumaMatte -- a fill+matte pair reconstructs as fill x matte in
+//    the compositor. That math is only correct when the fill carries
+//    STRAIGHT color; a premultiplied fill gets alpha multiplied in a
+//    second time. The graph unpremultiplies once, then splits: the
+//    straight branch becomes the color pass, its alpha plane becomes
+//    the matte pass. Zero-alpha pixels come out black from
+//    unpremultiply (0/0 defined as 0), which is harmless -- the matte
+//    zeroes them anyway.
+//
+// FORMAT PINNING (the negotiation fix): unpremultiply's output format
+// list and alphaextract's input format list failed to negotiate a
+// common format, killing the lumaMatte graph at runtime ("The
+// following filters could not choose their formats"). An explicit
+// format=rgba pin immediately after unpremultiply resolves it -- and
+// is applied in the proresAlpha graph too, so both alpha graphs hand
+// their downstream a declared, known format instead of trusting the
+// negotiator.
+//
+// Known tradeoff of unpremultiply: dividing by near-zero alpha
+// amplifies quantization noise in the faintest falloff pixels. At
+// 10-bit 4:4:4 (ProRes) and for synthetic glows this is invisible;
+// it is the standard cost of every straight-alpha export.
+//
+// INSTRUMENTATION: per-stage millisecond totals (render / readback /
 // wait) are printed every _timingReportInterval frames so the real
-// bottleneck is measurable, not guessed. Note readback now measures
-// only the residual await AFTER overlapping with the next render.
+// bottleneck is measurable, not guessed. Note readback measures only
+// the residual await AFTER overlapping with the next render. The same
+// stages are also accumulated across the WHOLE run and written into
+// the sidecar as a "performance" block (ExportPerformance) -- the
+// terminal report dies in stdout on a compiled release binary, so the
+// sidecar is where true pipeline speed vs realtime gets recorded.
+// Wall time for that block stops when the last frame is acked by the
+// writer (pipeline done), before FFmpeg's trailing-frame finalize.
 
 import 'dart:async';
 import 'dart:convert';
@@ -60,6 +111,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'manifest.dart';
+import 'raster_probe.dart';
 import 'visualization.dart';
 
 enum VideoExportFormat {
@@ -171,6 +223,10 @@ class _InFlightReadback {
 class FrameExporter {
   static const String exportDir = 'export';
 
+  // Diagnostic: run RasterProbe once at export start (see header).
+  // Leave true for production; costs a few hundred ms when on.
+  static const bool _runRasterProbe = false;
+
   // NVENC flags used by real exports.
   static const String _nvencPreset = 'p6';
   static const String _nvencCq = '18';
@@ -253,6 +309,11 @@ class FrameExporter {
       );
     }
 
+    // Diagnostic probe: prints scheduling report, exports normally after.
+    if (_runRasterProbe) {
+      await RasterProbe.run(width, height);
+    }
+
     final int frameCount = (durationSec * fps).ceil();
     final String project = ExportRecord.projectNameFromPath(sourcePath);
 
@@ -306,9 +367,16 @@ class FrameExporter {
         mattePath = actualOutputPath.replaceAll('.mp4', '_matte.mp4');
         videoCodec = h264Codec;
         args.addAll([
-          // Premultiplied input: color-over-black is just alpha drop.
+          // Unpremultiply ONCE, pin rgba (unpremultiply/alphaextract
+          // fail format negotiation without it), then split. Fill =
+          // straight color (alpha dropped by yuv420p), matte = the
+          // alpha plane. fill x matte in the comp reconstructs the
+          // plate exactly; a premultiplied fill would apply alpha
+          // twice.
           '-filter_complex',
-          '[0:v]split=2[fg][fa]; [fg]format=yuv420p[color]; [fa]alphaextract,format=yuv420p[matte]',
+          '[0:v]unpremultiply=inplace=1,format=rgba,split=2[fg][fa]; '
+              '[fg]format=yuv420p[color]; '
+              '[fa]alphaextract,format=yuv420p[matte]',
           '-map', '[color]', '-map', '1:a',
           '-c:v', h264Codec, '-preset', h264Preset,
           if (!useNvenc) ...['-crf', '18', '-threads', '0'],
@@ -327,6 +395,16 @@ class FrameExporter {
         actualOutputPath = actualOutputPath.replaceAll(RegExp(r'\.mp4$'), '.mov');
         videoCodec = 'prores_ks';
         args.addAll([
+          // ProRes 4444 alpha defaults to STRAIGHT interpretation in
+          // every NLE. Convert the premultiplied readback to straight
+          // at encode so the file matches that default -- no manual
+          // "premultiplied / matted with black" reinterpretation
+          // needed in the comp. format=rgba pins the graph output to
+          // a declared format (same negotiation class of failure as
+          // the lumaMatte graph).
+          '-filter_complex',
+          '[0:v]unpremultiply=inplace=1,format=rgba[straight]',
+          '-map', '[straight]', '-map', '1:a',
           '-c:v', 'prores_ks', '-profile:v', '4444',
           '-qscale:v', '11', '-pix_fmt', 'yuva444p10le',
           '-threads', '0', '-c:a', 'pcm_s16le', '-shortest',
@@ -339,6 +417,7 @@ class FrameExporter {
         videoCodec = h264Codec;
         args.addAll([
           // Premultiplied input: dropping alpha IS the black composite.
+          // The one format where NO unpremultiply is correct.
           '-filter_complex',
           '[0:v]format=yuv420p[color]',
           '-map', '[color]', '-map', '1:a',
@@ -432,9 +511,13 @@ class FrameExporter {
     // N+1 renders. Its ui.Image must stay alive until the bytes land.
     _InFlightReadback? inFlight;
 
-    // Stage timing accumulators (ms).
+    // Stage timing accumulators (ms). The window set resets at every
+    // console report; the total set runs the whole bake and feeds the
+    // sidecar performance block.
     final Stopwatch sw = Stopwatch();
     double msRender = 0, msReadback = 0, msWait = 0;
+    double totalRender = 0, totalReadback = 0, totalWait = 0;
+    double pipelineWallSec = 0; // frozen when the writer reports 'done'
     final Stopwatch wall = Stopwatch()..start();
     int lastProgressMs = -_progressIntervalMs;
 
@@ -447,7 +530,9 @@ class FrameExporter {
       sw..reset()..start();
       final ByteData? rawBytes = await f.bytes;
       f.frame.dispose();
-      msReadback += sw.elapsedMicroseconds / 1000.0;
+      final double readbackMs = sw.elapsedMicroseconds / 1000.0;
+      msReadback += readbackMs;
+      totalReadback += readbackMs;
 
       if (rawBytes == null) {
         throw Exception('Failed to extract raw pixels at frame ${f.index}.');
@@ -469,7 +554,9 @@ class FrameExporter {
       }
       toWriter.send(TransferableTypedData.fromList([bytes]));
       pendingAcks++;
-      msWait += sw.elapsedMicroseconds / 1000.0;
+      final double waitMs = sw.elapsedMicroseconds / 1000.0;
+      msWait += waitMs;
+      totalWait += waitMs;
 
       renderedFrames++;
 
@@ -526,7 +613,9 @@ class FrameExporter {
         // --- Render frame i (compositor owns retained frames) ---
         sw..reset()..start();
         final ui.Image frame = await compositor.advanceAsync(viz, ctx, isExport: true);
-        msRender += sw.elapsedMicroseconds / 1000.0;
+        final double renderMs = sw.elapsedMicroseconds / 1000.0;
+        msRender += renderMs;
+        totalRender += renderMs;
 
         // --- Kick off frame i's readback WITHOUT awaiting it ---
         final Future<ByteData?> bytesF =
@@ -548,6 +637,12 @@ class FrameExporter {
       if (writerError != null) {
         throw Exception('Frame writer failed during close: $writerError');
       }
+
+      // Pipeline complete: every frame rendered, read back, and acked
+      // by the writer. Freeze the performance clock here -- FFmpeg's
+      // trailing finalize below is container bookkeeping, not
+      // pipeline throughput.
+      pipelineWallSec = wall.elapsedMicroseconds / 1e6;
 
       onStatus?.call('Finalizing File...');
 
@@ -587,16 +682,32 @@ class FrameExporter {
       if (f.existsSync()) f.deleteSync();
     } catch (_) {}
 
-    // Save Manifest sidecar
-    final Map<String, dynamic> style = settings.toJson();
-    if (mattePath != null) style['matte_path'] = File(mattePath).absolute.path;
+    // Whole-run performance block for the sidecar.
+    ExportPerformance? performance;
+    if (renderedFrames > 0 && pipelineWallSec > 0) {
+      final double n = renderedFrames.toDouble();
+      final double exportFps = renderedFrames / pipelineWallSec;
+      performance = ExportPerformance(
+        exportWallSec: pipelineWallSec,
+        exportFps: exportFps,
+        realtimeFactor: exportFps / fps,
+        avgRenderMs: totalRender / n,
+        avgReadbackMs: totalReadback / n,
+        avgWriteWaitMs: totalWait / n,
+      );
+    }
 
+    // Save Manifest sidecar. style is a pure WaveformSettings
+    // snapshot; the matte path is first-class record data.
     final ExportRecord record = ExportRecord(
       project: project, sourcePath: File(sourcePath).absolute.path,
-      outputPath: File(actualOutputPath).absolute.path, visualization: viz.name,
+      outputPath: File(actualOutputPath).absolute.path,
+      mattePath: mattePath != null ? File(mattePath).absolute.path : null,
+      visualization: viz.name,
       format: format.name, videoCodec: videoCodec, nvencUsed: videoCodec == 'h264_nvenc',
       fps: fps, frameCount: renderedFrames, width: width, height: height,
-      dampening: dampening, audioDurationSec: durationSec, style: style,
+      dampening: dampening, audioDurationSec: durationSec, style: settings.toJson(),
+      performance: performance,
     );
     record.writeSidecar();
 

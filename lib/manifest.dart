@@ -5,6 +5,11 @@
 // needed to reproduce the bake exactly: source, visualization,
 // format/codec, geometry, and the full WaveformSettings style block.
 //
+// Also records whole-run pipeline performance (ExportPerformance):
+// the per-stage numbers the exporter prints to the terminal during
+// debug runs die in stdout on a compiled binary, so the sidecar is
+// where a release build reports its true speed vs realtime.
+//
 // The old export_manifest.json / merge.py schema is gone: the raw
 // pixel pipeline never writes PNG frame sequences, so there is
 // nothing for merge.py to merge. Reproducibility replaced it as
@@ -13,10 +18,54 @@
 import 'dart:convert';
 import 'dart:io';
 
+/// Whole-run export pipeline performance. Same stages as the
+/// terminal timing report, aggregated across every frame instead of
+/// per-60-frame windows. All averages are per-frame milliseconds.
+///
+/// Stage semantics (matching frame_exporter.dart instrumentation):
+///   render   -- advanceAsync: GPU rasterization round trip
+///   readback -- residual toByteData await AFTER overlapping with
+///               the next render (near zero when fully hidden)
+///   write_wait -- backpressure: waiting for a writer-isolate slot
+///               (FFmpeg encode falling behind shows up here)
+class ExportPerformance {
+  final double exportWallSec;    // total wall clock, first frame to last ack
+  final double exportFps;        // frames rendered / wall sec
+  final double realtimeFactor;   // exportFps / target fps (>1 = faster than realtime)
+  final double avgRenderMs;
+  final double avgReadbackMs;
+  final double avgWriteWaitMs;
+
+  const ExportPerformance({
+    required this.exportWallSec,
+    required this.exportFps,
+    required this.realtimeFactor,
+    required this.avgRenderMs,
+    required this.avgReadbackMs,
+    required this.avgWriteWaitMs,
+  });
+
+  static double _r(double v, [int places = 2]) {
+    final double f = places == 1 ? 10.0 : (places == 2 ? 100.0 : 1000.0);
+    return (v * f).roundToDouble() / f;
+  }
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'export_wall_sec': _r(exportWallSec),
+        'export_fps': _r(exportFps, 1),
+        'realtime_factor': _r(realtimeFactor),
+        'avg_render_ms': _r(avgRenderMs, 1),
+        'avg_readback_ms': _r(avgReadbackMs, 1),
+        'avg_write_wait_ms': _r(avgWriteWaitMs, 1),
+      };
+}
+
 class ExportRecord {
   final String project;
   final String sourcePath;       // absolute path to the audio source
   final String outputPath;       // absolute path to the rendered video
+  final String? mattePath;       // absolute path to the matte pass
+                                 // (lumaMatte format only, else null)
   final String visualization;    // Visualization.name
   final String format;           // VideoExportFormat name
   final String videoCodec;       // e.g. h264_nvenc / libx264 / prores_ks
@@ -28,12 +77,14 @@ class ExportRecord {
   final double dampening;
   final double audioDurationSec;
   final Map<String, dynamic> style; // WaveformSettings.toJson()
+  final ExportPerformance? performance; // null if export never measured
   final DateTime createdUtc;
 
   ExportRecord({
     required this.project,
     required this.sourcePath,
     required this.outputPath,
+    this.mattePath,
     required this.visualization,
     required this.format,
     required this.videoCodec,
@@ -45,15 +96,17 @@ class ExportRecord {
     required this.dampening,
     required this.audioDurationSec,
     required this.style,
+    this.performance,
     DateTime? createdUtc,
   }) : createdUtc = createdUtc ?? DateTime.now().toUtc();
 
   Map<String, dynamic> toJson() => <String, dynamic>{
-        'ananogram_export': 2,
+        'ananogram_export': 3,
         'project': project,
         'created_utc': createdUtc.toIso8601String(),
         'source_path': sourcePath,
         'output_path': outputPath,
+        if (mattePath != null) 'matte_path': mattePath,
         'visualization': visualization,
         'format': format,
         'video_codec': videoCodec,
@@ -65,6 +118,7 @@ class ExportRecord {
         'dampening': dampening,
         'audio_duration_sec': audioDurationSec,
         'style': style,
+        if (performance != null) 'performance': performance!.toJson(),
       };
 
   /// Writes the sidecar next to the rendered video:
