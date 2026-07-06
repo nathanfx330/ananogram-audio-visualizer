@@ -39,6 +39,8 @@ class CircularSpectrum implements Visualization {
 
     final WaveformSettings s = ctx.settings;
     
+    final double tSm = math.pow(smoothing, 30.0 * ctx.dt).toDouble();
+    
     final ui.Paint linePaint = ui.Paint()
       ..style = ui.PaintingStyle.stroke
       ..strokeWidth = (2.0 * s.strokeScale).clamp(1.0, 10.0)
@@ -64,7 +66,7 @@ class CircularSpectrum implements Visualization {
       }
 
       double level = (math.pow(peak, 0.6).toDouble() * ctx.dampening).clamp(0.0, 1.0);
-      _levels[b] = _levels[b] * smoothing + level * (1.0 - smoothing);
+      _levels[b] = _levels[b] * tSm + level * (1.0 - tSm);
       
       final double barLength = _levels[b] * (maxRadius - baseRadius);
       if (barLength < 1.0) continue;

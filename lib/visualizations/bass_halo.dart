@@ -24,7 +24,8 @@ class BassHalo implements Visualization {
     final WaveformSettings s = ctx.settings;
 
     // Smooth the bass band energy
-    _smoothBass = _smoothBass * 0.8 + (ctx.bass * 2.0) * 0.2;
+    final double tSm = math.pow(0.8, 30.0 * ctx.dt).toDouble();
+    _smoothBass = _smoothBass * tSm + (ctx.bass * 2.0) * (1.0 - tSm);
     _smoothBass = _smoothBass.clamp(0.0, 1.0);
 
     // Base radius scales with bass

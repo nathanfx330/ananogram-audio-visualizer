@@ -9,8 +9,11 @@ import '../visualization.dart';
 /// A pseudo-3D scrolling history of the spectrum.
 /// Often called a Waterfall or Ridge plot.
 class RidgePlotSpectrum implements Visualization {
-  static const int historySize = 40;
+  // Target exactly 1.333 seconds of history on screen.
+  // At 30 FPS, this equals the original 40 lines of history.
+  static const double historyDurationSec = 1.333;
   static const int points = 64;
+  
   final List<List<double>> _history = [];
 
   @override
@@ -27,6 +30,10 @@ class RidgePlotSpectrum implements Visualization {
     final double h = ctx.height.toDouble();
     final Float32List spec = ctx.spectrum;
     final double binHz = ctx.sampleRate / VizContext.fftSize;
+
+    // Dynamically calculate how many lines we need to hold to fill `historyDurationSec`
+    // at the current framerate (1 / dt).
+    final int historySize = (historyDurationSec / ctx.dt).round().clamp(10, 240);
 
     // 1. Process current frame into `points` number of bins
     List<double> currentLine = List.filled(points, 0.0);
@@ -48,12 +55,15 @@ class RidgePlotSpectrum implements Visualization {
 
     // 2. Add to history, remove oldest
     _history.insert(0, currentLine);
-    if (_history.length > historySize) {
+    while (_history.length > historySize) {
       _history.removeLast();
     }
 
     // 3. Draw from back to front to get proper occlusion (3D effect)
     final WaveformSettings s = ctx.settings;
+    
+    // Scale the vertical spacing based on the dynamic history size so the 
+    // waterfall always takes up the exact same physical space on screen!
     final double lineSpacing = h / (historySize + 10);
     final double maxSpike = lineSpacing * 8.0;
 
@@ -68,8 +78,8 @@ class RidgePlotSpectrum implements Visualization {
       final List<double> lineData = _history[i];
       // Perspective offset (shift X and Y as it goes back in time)
       final double yBase = h - (i * lineSpacing) - WaveformStyle.edgeMargin;
-      final double xOffset = i * (w * 0.005); 
-      final double rowWidth = w - (historySize * w * 0.005);
+      final double xOffset = i * (w * 0.005 * (40.0 / historySize)); 
+      final double rowWidth = w - (historySize * w * 0.005 * (40.0 / historySize));
       final double step = rowWidth / (points - 1);
 
       final ui.Path path = ui.Path();

@@ -35,6 +35,8 @@ class SpectrumBars implements Visualization {
 
     final double logLo = math.log(loHz);
     final double logHi = math.log(hiHz);
+    
+    final double tSm = math.pow(smoothing, 30.0 * ctx.dt).toDouble();
 
     final WaveformSettings s = ctx.settings;
     final double gap = 2.0;
@@ -69,7 +71,7 @@ class SpectrumBars implements Visualization {
           (math.pow(peak, 0.5).toDouble() * ctx.dampening)
               .clamp(0.0, 1.0);
 
-      _levels[b] = _levels[b] * smoothing + level * (1.0 - smoothing);
+      _levels[b] = _levels[b] * tSm + level * (1.0 - tSm);
       final double barH = _levels[b] * maxBarH;
       if (barH < 0.5) continue;
 

@@ -16,6 +16,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'ffmpeg_decode.dart';
 import 'frame_exporter.dart';
@@ -26,7 +27,18 @@ import 'wav_decoder.dart';
 
 const int kTargetSampleRate = 44100;
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await windowManager.ensureInitialized();
+  
+  WindowOptions windowOptions = const WindowOptions(
+    title: 'Ananogram',
+  );
+  windowManager.waitUntilReadyToShow(windowOptions, () async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
+
   runApp(const AnanogramApp());
 }
 
@@ -100,7 +112,7 @@ class AnanogramHome extends StatefulWidget {
   State<AnanogramHome> createState() => _AnanogramHomeState();
 }
 
-class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProviderStateMixin {
+class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProviderStateMixin, WindowListener {
   // --- Audio state ---
   Float32List? _audio;
   int _sampleRate = kTargetSampleRate;
@@ -114,6 +126,9 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
   double _playStartPos = 0.0;
   DateTime _playStartWall = DateTime.now();
   bool _scrubbing = false;
+  
+  // Tracks how long the audio has been paused to let the trail fade out
+  double _timeSincePaused = 0.0;
 
   // --- Settings ---
   double _volume = 1.0;
@@ -145,6 +160,18 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
   int _viewW = 0;
   int _viewH = 0;
 
+  // Live-preview render throttle. The Ticker fires at monitor vsync
+  // (60/120/144 Hz), but the preview is a monitor, not the
+  // deliverable -- 30fps of distinct frames is imperceptible for a
+  // scope. Capping the LIVE render rate caps how fast orphaned
+  // GC-owned textures are minted during playback, which (with the
+  // continuous-time floor decay) no longer reach a fixed point and so
+  // must not be produced every vsync. Export is unaffected: it never
+  // touches this path. dt still accumulates every tick so the decay
+  // math stays wall-accurate; only advance() is gated.
+  static const double _liveRenderIntervalSec = 1.0 / 30.0;
+  double _sinceLiveRender = 0.0;
+
   // --- Export ---
   bool _exporting = false;
   int _exportDone = 0;
@@ -155,10 +182,27 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
+    // Intercept the close event so we can kill FFmpeg cleanly
+    windowManager.setPreventClose(true);
+
     _visualizations = buildVisualizations();
     _viz = _visualizations.first;
     _ticker = createTicker(_onTick)..start();
     _initPlayback();
+  }
+
+  @override
+  void onWindowClose() async {
+    if (_exporting && _cancelToken != null) {
+      setState(() {
+        _statusMessage = 'Emergency teardown... killing encoders before exit.';
+      });
+      _cancelToken!.cancel();
+      // Wait half a second to let the finally block slaughter the FFmpeg ghosts
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    await windowManager.destroy();
   }
 
   Future<void> _initPlayback() async {
@@ -177,6 +221,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
 
   @override
   void dispose() {
+    windowManager.removeListener(this);
     _ticker.dispose();
     _playback?.stop();
     _compositor?.dispose();
@@ -191,7 +236,12 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
 
     if (_audio == null || _exporting) return;
 
+    bool wantsRender = false;
+
     if (_playing) {
+      _timeSincePaused = 0.0;
+      wantsRender = true;
+
       final double wallElapsed = DateTime.now().difference(_playStartWall).inMicroseconds / 1e6;
       _currentTime = _playStartPos + wallElapsed;
       if (_currentTime >= _totalTime) {
@@ -199,9 +249,30 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
         _playing = false;
         _playback?.stop();
       }
+    } else {
+      // Paused: keep rendering until the trail fades, then the Ticker
+      // goes fully idle (no advance, no setState) so the GC can sweep
+      // the orphaned live textures.
+      _timeSincePaused += dt;
+      if (_timeSincePaused < 2.0) {
+        wantsRender = true;
+      }
     }
 
-    if (_viewW > 0 && _viewH > 0) {
+    // Throttle the live render to _liveRenderIntervalSec. The Ticker
+    // still fires every vsync (and dt above stays accurate), but we
+    // only mint a new frame/texture at the capped rate -- bounding the
+    // rate of GC-owned texture churn during playback. A forced render
+    // (viz switch, scrub, settings change) zeroes _timeSincePaused,
+    // which does NOT reset this accumulator, so it lands on the next
+    // slot within at most one interval -- visually immediate.
+    _sinceLiveRender += dt;
+    if (wantsRender && _sinceLiveRender < _liveRenderIntervalSec) {
+      return;
+    }
+    _sinceLiveRender = 0.0;
+
+    if (wantsRender && _viewW > 0 && _viewH > 0) {
       _compositor ??= VizCompositor(width: _viewW, height: _viewH);
       final VizContext ctx = VizContext(
         audio: _audio!,
@@ -216,9 +287,9 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
       );
       _compositor!.advance(_viz, ctx);
       _frameCounter++;
-    }
 
-    setState(() {});
+      setState(() {});
+    }
   }
 
   void _onViewSized(int w, int h) {
@@ -235,6 +306,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
       _viz = v;
       _viz.reset();
       _compositor?.clear();
+      _timeSincePaused = 0.0; // Force a render to show the new viz
     });
   }
 
@@ -305,6 +377,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
         _loadedPath = path;
         _currentTime = 0.0;
         _playing = false;
+        _timeSincePaused = 0.0; // Force a render to show the loaded state
         for (final Visualization v in _visualizations) {
           v.reset();
         }
@@ -344,6 +417,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
       if (_currentTime > _totalTime) _currentTime = _totalTime;
     }
     _playing = false;
+    _timeSincePaused = 0.0; // Keep rendering briefly so the trail fades out
     await _playback?.stop();
     if (mounted) setState(() {});
   }
@@ -363,6 +437,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
     setState(() {
       _scrubbing = true;
       _currentTime = (fraction.clamp(0.0, 1.0)) * _totalTime;
+      _timeSincePaused = 0.0; // Render the new scrubbed position
     });
   }
 
@@ -620,6 +695,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                           ],
                           onChanged: (v) => both(() {
                             if (v != null) _settings.backgroundColor = v;
+                            _timeSincePaused = 0.0; // Force render to show new BG
                           }),
                         ),
                       ],
@@ -629,14 +705,20 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     Slider(
                       value: _settings.trailRetention,
                       max: 0.98,
-                      onChanged: (v) => both(() => _settings.trailRetention = v),
+                      onChanged: (v) => both(() {
+                        _settings.trailRetention = v;
+                        _timeSincePaused = 0.0; // Force render to show trail length
+                      }),
                     ),
 
                     Text('Glow Blur: ${_settings.glowBlurSigma.toStringAsFixed(1)} px'),
                     Slider(
                       value: _settings.glowBlurSigma,
                       max: 8.0,
-                      onChanged: (v) => both(() => _settings.glowBlurSigma = v),
+                      onChanged: (v) => both(() {
+                        _settings.glowBlurSigma = v;
+                        _timeSincePaused = 0.0; // Force render to show blur
+                      }),
                     ),
 
                     Text('Stroke Width: ${(_settings.strokeScale * 100).round()}%'),
@@ -644,7 +726,10 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                       value: _settings.strokeScale,
                       min: 0.25,
                       max: 4.0,
-                      onChanged: (v) => both(() => _settings.strokeScale = v),
+                      onChanged: (v) => both(() {
+                        _settings.strokeScale = v;
+                        _timeSincePaused = 0.0; // Force render to show width
+                      }),
                     ),
                     const Divider(height: 24),
 
@@ -663,6 +748,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                             _settings.outerColor = p.outer.value;
                             _settings.midColor = p.mid.value;
                             _settings.coreColor = p.core.value;
+                            _timeSincePaused = 0.0; // Force render to show color
                           }),
                         );
                       }).toList(),
@@ -676,6 +762,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                 onPressed: () => both(() {
                   _settings.resetToDefaults();
                   _dampening = 1.0;
+                  _timeSincePaused = 0.0;
                 }),
                 child: const Text('Reset Plugin Defaults'),
               ),

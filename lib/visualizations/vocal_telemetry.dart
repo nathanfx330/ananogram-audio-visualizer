@@ -28,7 +28,8 @@ class VocalTelemetry implements Visualization {
 
     // Human speech lives heavily in the mid-band. We use this to modulate
     // the intensity of the playhead.
-    _smoothMid = _smoothMid * 0.8 + (ctx.midBand * 2.0) * 0.2;
+    final double tSm = math.pow(0.8, 30.0 * ctx.dt).toDouble();
+    _smoothMid = _smoothMid * tSm + (ctx.midBand * 2.0) * (1.0 - tSm);
     _smoothMid = _smoothMid.clamp(0.0, 1.0);
 
     // --- 1. DRAW ANALYTICAL GRID ---

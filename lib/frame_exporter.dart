@@ -141,9 +141,9 @@
 // every _timingReportInterval frames (tag [export]) and accumulates
 // whole-run into the sidecar. The CPU pool returns aggregated
 // SoftBakeStats (pooled per-frame render + write, real parallel wall
-// time, parallel efficiency, replay cost, and a per-worker
-// breakdown). Both feed the sidecar "performance" block. On the CPU
-// path avg_readback_ms is 0.0 by construction (no GPU readback
+// time, parallel efficiency, replay cost, trail-warmup cost, and a
+// per-worker breakdown). Both feed the sidecar "performance" block. On
+// the CPU path avg_readback_ms is 0.0 by construction (no GPU readback
 // exists) and avg_write_wait_ms is the pooled blocking FIFO write.
 // Wall time is the pool's parallel wall (first worker start to last
 // worker done), excluding concat + final pass, which are container/
@@ -1159,9 +1159,10 @@ class FrameExporter {
         avgWriteWaitMs: st.avgWriteWaitMs,
       );
 
-      // Summary line: the headline throughput plus the two tuning
-      // signals -- parallel efficiency (idle-core detector) and the
-      // worst replay (straggler tax).
+      // Summary line: the headline throughput plus the tuning
+      // signals -- parallel efficiency (idle-core detector), the
+      // worst replay (scan-only straggler tax), and the worst warm-up
+      // (trail-rebuild tax, grows with retention up to K frames).
       print('[export-cpu] pool: ${st.workerCount} workers, '
           '${st.framesRendered} frames, '
           '${st.wallSec.toStringAsFixed(2)}s wall, '
@@ -1169,15 +1170,19 @@ class FrameExporter {
           '(${(exportFps / fps).toStringAsFixed(2)}x realtime)  '
           '| eff ${(st.parallelEfficiency * 100).toStringAsFixed(0)}%  '
           'replay avg ${st.avgReplayMs.toStringAsFixed(0)}ms '
-          'max ${st.maxReplayMs.toStringAsFixed(0)}ms');
+          'max ${st.maxReplayMs.toStringAsFixed(0)}ms  '
+          'warmup avg ${st.avgWarmupMs.toStringAsFixed(0)}ms '
+          'max ${st.maxWarmupMs.toStringAsFixed(0)}ms');
       print('[export-cpu]   pooled per-frame: '
           'render ${st.avgRenderMs.toStringAsFixed(1)}ms  '
           'write ${st.avgWriteWaitMs.toStringAsFixed(1)}ms');
 
       // Per-worker breakdown: one line each so a straggler (long wall,
-      // or replay eating its time) or a starved worker (high write) is
-      // immediately visible while tuning worker count. renderMs/writeMs
-      // are chunk totals; per-frame divides by that worker's frames.
+      // or replay/warm-up eating its time) or a starved worker (high
+      // write) is immediately visible while tuning worker count.
+      // renderMs/writeMs are chunk totals; per-frame divides by that
+      // worker's frames. replay is scan-only catch-up; warmup is the
+      // full-render trail rebuild (both grow with chunk index).
       final int nWorkers = st.perWorkerWallSec.length;
       final int framesPerWorker =
           nWorkers > 0 ? (st.framesRendered / nWorkers).round() : 0;
@@ -1186,6 +1191,7 @@ class FrameExporter {
         final double rMs = st.perWorkerRenderMs[w];
         final double wMs = st.perWorkerWriteMs[w];
         final double repMs = st.perWorkerReplayMs[w];
+        final double warmMs = st.perWorkerWarmupMs[w];
         final double perFrameR =
             framesPerWorker > 0 ? rMs / framesPerWorker : 0.0;
         final double perFrameW =
@@ -1194,7 +1200,8 @@ class FrameExporter {
             'wall ${wallS.toStringAsFixed(2)}s  '
             'render ${perFrameR.toStringAsFixed(1)}ms/f  '
             'write ${perFrameW.toStringAsFixed(1)}ms/f  '
-            'replay ${repMs.toStringAsFixed(0)}ms');
+            'replay ${repMs.toStringAsFixed(0)}ms  '
+            'warmup ${warmMs.toStringAsFixed(0)}ms');
       }
     }
 

@@ -9,7 +9,9 @@ import '../visualization.dart';
 /// A 2D heatmap/spectrogram plotting frequency over time.
 /// Designed with a discrete, pixelated grid for a forensic/data aesthetic.
 class VoiceprintSpectrogram implements Visualization {
-  static const int timeColumns = 120; // X-axis resolution (history)
+  // Target exactly 4.0 seconds of history on screen.
+  // At 30 FPS, this equals the original 120 columns of history.
+  static const double historyDurationSec = 4.0;
   static const int freqRows = 64;     // Y-axis resolution (frequencies)
   
   final List<List<double>> _history = [];
@@ -29,6 +31,10 @@ class VoiceprintSpectrogram implements Visualization {
     final WaveformSettings s = ctx.settings;
     final Float32List spec = ctx.spectrum;
     final double binHz = ctx.sampleRate / VizContext.fftSize;
+
+    // Dynamically calculate how many columns we need to hold to fill `historyDurationSec`
+    // at the current framerate (1 / dt).
+    final int timeColumns = (historyDurationSec / ctx.dt).round().clamp(10, 500);
 
     // --- 1. PROCESS CURRENT FRAME ---
     List<double> currentColumn = List.filled(freqRows, 0.0);
@@ -54,7 +60,7 @@ class VoiceprintSpectrogram implements Visualization {
 
     // --- 2. UPDATE HISTORY ---
     _history.insert(0, currentColumn);
-    if (_history.length > timeColumns) {
+    while (_history.length > timeColumns) {
       _history.removeLast();
     }
 

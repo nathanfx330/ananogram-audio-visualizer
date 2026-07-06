@@ -1,5 +1,6 @@
 // ./lib/visualizations/phosphor_waveform.dart
 
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 import '../visualization.dart';
 
@@ -39,8 +40,9 @@ class PhosphorWaveform implements Visualization {
     }
     currentPeak += 1e-8;
 
-    _peakSmoothed = _peakSmoothed * WaveformStyle.agcSmoothing +
-        currentPeak * (1.0 - WaveformStyle.agcSmoothing);
+    final double tSm = math.pow(WaveformStyle.agcSmoothing, 30.0 * ctx.dt).toDouble();
+    _peakSmoothed = _peakSmoothed * tSm + currentPeak * (1.0 - tSm);
+    
     if (_peakSmoothed < WaveformStyle.peakFloor) {
       _peakSmoothed = WaveformStyle.peakFloor;
     }

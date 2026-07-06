@@ -10,6 +10,7 @@
 // sequence of times must always produce identical output. That
 // contract is what lets the exporter bake any plugin.
 
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/rendering.dart';
@@ -18,6 +19,7 @@ import 'viz_state.dart';
 import 'visualizations/bass_halo.dart';
 import 'visualizations/circular_spectrum.dart';
 import 'visualizations/dot_matrix.dart';
+import 'visualizations/line_spectrum.dart';
 import 'visualizations/phosphor_waveform.dart';
 import 'visualizations/ridge_plot.dart';
 import 'visualizations/spectrogram.dart';
@@ -61,8 +63,15 @@ abstract class Visualization {
 ///
 ///  * Live (advance): frames are GC-owned. The previous frame is
 ///    NEVER explicitly disposed, because VizBlitPainter may be
-///    blitting it on the current vsync. At display rate the GC keeps
-///    up fine; this was never the leaking path.
+///    blitting it on the current vsync -- and the UI can repaint a
+///    cached frame at any time (e.g. on pointer hover), so there is
+///    no vsync count after which an explicit dispose is provably
+///    safe. Disposing here crashes the engine ("painting disposed
+///    image"). Live VRAM is instead bounded by HALTING THE TICKER
+///    when idle (see main.dart _onTick): the GC only needs an idle
+///    gap to sweep the orphaned textures, and stopping advance()
+///    calls gives it one. This is the sanctioned live-path model --
+///    do not add explicit disposal here.
 ///
 ///  * Export (advanceAsync): frames are compositor-owned. The
 ///    superseded frame is disposed the instant the new one is
@@ -99,10 +108,12 @@ class VizCompositor {
       Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
     );
 
-    final double retention = ctx.settings.trailRetention.clamp(0.0, 0.995);
-    if (_frame != null && retention > 0.0) {
+    final double r30 = ctx.settings.trailRetention.clamp(0.0, 0.995);
+    if (_frame != null && r30 > 0.0) {
+      // Continuous-time decay: map the 30fps-tuned retention to actual time elapsed
+      final double r = math.pow(r30, 30.0 * ctx.dt).toDouble();
       final Paint decayPaint = Paint()
-        ..color = const Color(0xFFFFFFFF).withOpacity(retention);
+        ..color = const Color(0xFFFFFFFF).withOpacity(r);
       canvas.drawImage(_frame!, Offset.zero, decayPaint);
     }
 
@@ -111,7 +122,10 @@ class VizCompositor {
   }
 
   /// Live path. Synchronous to match monitor vsync. Frames are
-  /// GC-owned: never disposed here, the painter may hold the old one.
+  /// GC-owned: never disposed here, the painter may hold the old one
+  /// and the UI may repaint a cached frame on interaction. VRAM is
+  /// bounded by the Ticker halting when idle (main.dart), not by
+  /// disposal here.
   /// [isExport] is retained for call-site compatibility and ignored.
   ui.Image advance(Visualization viz, VizContext ctx,
       {bool isExport = false}) {
@@ -156,6 +170,7 @@ class VizCompositor {
 List<Visualization> buildVisualizations() => <Visualization>[
       PhosphorWaveform(),
       SpectrumBars(),
+      LineSpectrum(),
       CircularSpectrum(),
       RidgePlotSpectrum(),
       DotMatrixSpectrum(),

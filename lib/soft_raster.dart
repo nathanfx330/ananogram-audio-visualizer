@@ -18,11 +18,10 @@
 //
 // RENDER MODEL (mirrors VizCompositor + MaskFilter semantics):
 //
-//  * decay(retention) is the trail: a per-pixel multiply of all four
+//  * decay(retention, dt) is the trail: a per-pixel multiply of all four
 //    channels. The GPU path draws the previous premultiplied frame
-//    with paint opacity = retention, which quantizes retention
-//    through an 8-bit alpha first -- decay() quantizes identically
-//    so trail length matches the preview, not just approximately.
+//    with paint opacity = retention. We apply continuous-time decay
+//    to guarantee 60fps and 30fps exports look mathematically identical.
 //
 //  * Every draw op rasterizes ANTI-ALIASED COVERAGE (one float per
 //    pixel) into a scratch buffer, optionally Gaussian-blurs that
@@ -78,26 +77,47 @@ class SoftCanvas {
     pixels.fillRange(0, pixels.length, 0);
   }
 
-  /// Trail decay: multiplies every channel of every pixel (color AND
-  /// alpha -- the buffer is premultiplied) by [retention].
+  /// Trail decay: multiplies every channel of every pixel by the
+  /// frame-rate-independent retention value, using a FLOOR (truncate)
+  /// multiply rather than round so the swept region reaches true zero.
   ///
-  /// Matches VizCompositor._record's decay draw, including its 8-bit
-  /// quantization: withOpacity(r) rounds r to an 8-bit alpha before
-  /// Skia modulates, so we quantize the same way. Without this the
-  /// soft trail decays at a subtly different rate and diverges from
-  /// the preview over hundreds of frames.
-  void decay(double retention) {
-    final double r = retention.clamp(0.0, 1.0);
-    if (r <= 0.0) {
+  /// WHY FLOOR, NOT ROUND: on an 8-bit buffer a rounding multiply has
+  /// fixed points. round(v*rq) == v for every v <= 0.5/(1-rq), so all
+  /// low values freeze and never fade -- a permanent residual that at
+  /// high retention is a visible alpha haze in the exported matte
+  /// (rq=0.98 -> everything <= 25/255 sticks, ~10% alpha forever). The
+  /// floor rises with fps, because rq = retention^(30*dt) climbs toward
+  /// 1, so the same setting leaves MORE residual at 60fps than 30fps --
+  /// which also silently broke the fps-parity claim. A truncating
+  /// multiply has NO positive fixed point: floor(v*rq) <= v*rq < v for
+  /// all v > 0 when rq < 1, so every value drops by at least 1 each
+  /// frame and the region clears to zero. The bright body still decays
+  /// as ~v*rq (the sub-1-LSB truncation is invisible there); only the
+  /// deep tail changes, from a stuck plateau to a linear ramp-to-zero.
+  void decay(double retention, double dt) {
+    final double r30 = retention.clamp(0.0, 1.0);
+    if (r30 <= 0.0) {
       clear();
       return;
     }
-    if (r >= 1.0) return;
+    if (r30 >= 1.0) return;
+
+    // Treat the user's slider value as "retention per 1/30th of a
+    // second" so the visual feel is fps-independent. R_frame = S^(30*dt).
+    final double r = math.pow(r30, 30.0 * dt).toDouble();
 
     final double rq = (r * 255.0).round() / 255.0; // 8-bit quantized
     final Uint8List lut = Uint8List(256);
-    for (int i = 0; i < 256; i++) {
-      lut[i] = (i * rq + 0.5).toInt();
+    lut[0] = 0;
+    for (int i = 1; i < 256; i++) {
+      // Truncate toward zero (floor for non-negative), not round.
+      // For any rq < 1 this already yields <= i-1, so the trail dies.
+      // min(_, i-1) only bites in the degenerate rq == 1.0 case (only
+      // reachable at absurd fps): it forces a strict -1/frame so the
+      // trail still clears instead of freezing. For rq < 1 it is a
+      // no-op and the decay curve is untouched.
+      final int decayed = (i * rq).toInt();
+      lut[i] = decayed < i ? decayed : i - 1;
     }
     final Uint8List px = pixels;
     for (int i = 0; i < px.length; i++) {

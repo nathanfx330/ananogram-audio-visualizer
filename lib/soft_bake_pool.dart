@@ -31,23 +31,49 @@
 // frame-exact, no re-encode, no GOP seam. Audio is muxed once, at
 // that final concat, by the caller.
 //
-// CHEAP REPLAY (property 4, preserved): chunks are contiguous, so a
-// worker rebuilds plugin state by running reset() then replaying
-// frames [0, chunkStart) with rendering SUPPRESSED -- it drives the
-// plugin's per-frame state recurrence (e.g. Phosphor's _peakSmoothed
-// AGC) without stamping pixels. For the ported plugins the suppressed
-// pass costs a peak-scan / FFT, not rasterization. The determinism
-// contract guarantees the replayed state is bit-identical to a
-// straight-through render's, so segment K's first real frame is
-// exactly the frame it would have been in a serial bake.
+// REPLAY (property 4, preserved): chunks are contiguous, so a worker
+// rebuilds everything frame chunkStart needs by replaying [0,
+// chunkStart) in two parts:
+//
+//   1. STATE catch-up, frames [0, chunkStart - K): rendering
+//      SUPPRESSED -- drives the plugin's per-frame state recurrence
+//      (e.g. Phosphor's _peakSmoothed AGC) without stamping pixels.
+//      Scan-only (peak scan / FFT), no rasterization. The determinism
+//      contract makes this state bit-identical to a serial render's.
+//
+//   2. TRAIL warm-up, frames [chunkStart - K, chunkStart): FULL
+//      render (decay + stamp) exactly like the real loop, but NOT
+//      written to the FIFO. This reconstructs the framebuffer trail a
+//      serial bake would have accumulated entering chunkStart. K is
+//      the exact number of frames a max-value (255) stamp survives
+//      before the decay LUT floors it to zero, so every past frame
+//      whose stamp could still be visible at chunkStart is replayed,
+//      and older ones (drained to nothing) are not. Because the
+//      decay's strict per-frame decrease drains every pre-window
+//      residual to zero within the same K frames, the reconstructed
+//      canvas matches a serial bake's, not just approximately.
+//
+//      Without this the canvas starts each chunk COLD and the trail
+//      visibly builds up from black over the first K frames -- a
+//      periodic dimming/pumping seam at every chunk boundary, worst
+//      at high retention where the afterglow is longest (which is
+//      exactly where a cold start is most wrong).
+//
+// K = framesToZero(rq): ~1 frame at low retention, ~33 at the default
+// (215/255), up to a HARD 255 at the ceiling -- the decay LUT drops a
+// max-value stamp by at least one level per frame, so K can never
+// exceed 255 no matter how high retention goes. The warm-up cost thus
+// scales with how long the trail actually persists (inherent), capped.
 //
 // REDUNDANT WORK: worker k replays k*chunkLen frames. Summed across
-// the pool that is ~N*(N-1)/2 chunk-lengths of suppressed passes, but
-// they run in parallel and suppressed frames skip the stamp, so the
-// wall-time cost is one worker's replay (the last chunk's), scan-only.
-// This is now MEASURED, not asserted: each worker reports its replay
-// milliseconds separately, and the pool surfaces the worst so a
-// straggling last chunk is visible instead of hidden in the average.
+// the pool that is ~N*(N-1)/2 chunk-lengths, but they run in parallel,
+// so the wall-time cost is one worker's replay (the last chunk's):
+// mostly scan-only suppressed frames plus up to K full-render warm-up
+// frames at the tail. Both are MEASURED, not asserted -- each worker
+// reports suppressed-replay and warm-up milliseconds separately, and
+// the pool surfaces the worst of each so a straggling last chunk (or
+// a warm-up-heavy high-retention bake) is visible instead of hidden
+// in the average.
 //
 // MEMORY: one SoftCanvas per worker (W*H*4 bytes) + OS pipe buffers.
 // Flat in duration and in frame count; scales with worker count and
@@ -70,6 +96,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'soft_raster.dart';
@@ -86,11 +113,16 @@ import 'viz_state.dart';
 ///   parallelEfficiency -- (sum of per-worker busy time) /
 ///     (wallSec * workerCount). 1.0 = every core busy the whole wall;
 ///     lower = idle cores (encode starvation or a straggler).
-///   perWorkerWallSec   -- each worker's own render+write wall
-///     (excludes replay). The spread exposes stragglers.
+///   perWorkerWallSec   -- each worker's real render+write wall only
+///     (excludes suppressed replay AND trail warm-up). The spread
+///     exposes stragglers.
 ///   perWorkerReplayMs  -- suppressed-replay cost per worker. Grows
 ///     with chunk index; the last worker's is the redundant-work tax.
 ///   avgReplayMs / maxReplayMs -- pooled and worst replay.
+///   perWorkerWarmupMs  -- trail warm-up cost per worker (full-render
+///     frames that rebuild the trail but aren't written). Also grows
+///     with chunk index, and with retention (up to K=255 frames).
+///   avgWarmupMs / maxWarmupMs -- pooled and worst warm-up.
 class SoftBakeStats {
   final int workerCount;
   final int framesRendered;      // real frames (excludes suppressed replay)
@@ -99,10 +131,13 @@ class SoftBakeStats {
   final double avgWriteWaitMs;   // pooled per-frame blocking-write cost
   final double avgReplayMs;      // mean per-worker suppressed-replay ms
   final double maxReplayMs;      // worst (last chunk) suppressed-replay ms
+  final double avgWarmupMs;      // mean per-worker trail-warmup ms
+  final double maxWarmupMs;      // worst (last chunk) trail-warmup ms
   final double parallelEfficiency; // sum(busy) / (wall * workers), 0..1
   final List<double> perWorkerRenderMs;
   final List<double> perWorkerWriteMs;
   final List<double> perWorkerReplayMs;
+  final List<double> perWorkerWarmupMs;
   final List<double> perWorkerWallSec;
 
   const SoftBakeStats({
@@ -113,10 +148,13 @@ class SoftBakeStats {
     required this.avgWriteWaitMs,
     required this.avgReplayMs,
     required this.maxReplayMs,
+    required this.avgWarmupMs,
+    required this.maxWarmupMs,
     required this.parallelEfficiency,
     required this.perWorkerRenderMs,
     required this.perWorkerWriteMs,
     required this.perWorkerReplayMs,
+    required this.perWorkerWarmupMs,
     required this.perWorkerWallSec,
   });
 }
@@ -185,6 +223,25 @@ class _WorkerConfig {
   });
 }
 
+/// Frames for a max-value (255) stamp to decay to exactly zero under
+/// per-frame retention [rq], iterating the SAME transfer SoftCanvas'
+/// decay LUT applies (floor multiply, with a forced -1/frame in the
+/// degenerate rq >= 1.0 case). This is the trail warm-up window: any
+/// frame older than this has a stamp that has floored to zero and so
+/// cannot affect the canvas at a chunk boundary. The forced strict
+/// decrease bounds the result at 255 and guarantees termination.
+int _framesToZero(double rq) {
+  if (rq <= 0.0) return 0;
+  int v = 255;
+  int m = 0;
+  while (v > 0 && m < 255) {
+    final int decayed = (v * rq).toInt();
+    v = decayed < v ? decayed : v - 1;
+    m++;
+  }
+  return m;
+}
+
 /// Worker isolate entry point.
 ///
 /// Protocol (worker -> pool, via reply):
@@ -193,10 +250,11 @@ class _WorkerConfig {
 ///   ('progress', workerId, framesDoneInChunk)
 ///     throttled
 ///   ('done', workerId, framesRendered, renderMs, writeMs,
-///            replayMs, workerWallSec)
+///            replayMs, warmupMs, workerWallSec)
 ///     chunk complete; renderMs/writeMs are chunk totals, replayMs is
-///     the suppressed-replay cost, workerWallSec is this worker's own
-///     render+write wall (excludes replay)
+///     the suppressed-replay cost, warmupMs is the trail-warmup cost,
+///     workerWallSec is this worker's own real render+write wall
+///     (excludes replay and warm-up)
 ///   'error:<workerId>:<msg>'
 ///     any failure (EPIPE on cancel)
 ///
@@ -229,17 +287,34 @@ void _workerMain(_WorkerConfig cfg) {
     final double retention =
         cfg.settings.trailRetention.clamp(0.0, 0.995);
 
-    // --- Replay [0, chunkStart) with rendering suppressed ---
-    // Drive the plugin's per-frame state recurrence to the chunk
-    // start without stamping. renderSuppressed drives the same audio
-    // analysis path the real render's first pass uses (peak scan /
-    // FFT), so state evolves identically -- but no coverage is
-    // stamped and the framebuffer is never touched. The determinism
-    // contract makes the resulting state bit-identical to a serial
-    // bake's state entering this frame. Timed separately so the
-    // redundant-work tax is visible in the stats, not buried.
+    // Trail warm-up window length: the exact number of frames a
+    // max-value (255) stamp survives before the decay LUT floors it
+    // to zero. Frames older than this contribute nothing to the
+    // canvas at chunkStart, so they need only suppressed (state)
+    // replay; frames inside it must be fully rendered so the trail
+    // entering the real chunk matches a serial bake. Computed from
+    // the SAME rq the decay LUT uses (rq is constant, since dt is).
+    int warmupFrames;
+    if (retention <= 0.0) {
+      warmupFrames = 0; // no trail: decay clears every frame
+    } else {
+      final double r = math.pow(retention, 30.0 * dt).toDouble();
+      final double rq = (r * 255.0).round() / 255.0;
+      warmupFrames = _framesToZero(rq);
+    }
+    if (warmupFrames > cfg.chunkStart) warmupFrames = cfg.chunkStart;
+    final int warmStart = cfg.chunkStart - warmupFrames;
+
+    // --- Part 1: suppressed state catch-up, frames [0, warmStart) ---
+    // Drive the plugin's per-frame state recurrence without stamping.
+    // renderSuppressed runs the same audio analysis (peak scan / FFT)
+    // render()'s first pass does, so state evolves identically -- but
+    // no coverage is stamped and the framebuffer is untouched. The
+    // determinism contract makes the resulting state bit-identical to
+    // a serial bake's. Scan-only; timed separately as the redundant-
+    // work tax.
     final Stopwatch replaySw = Stopwatch()..start();
-    for (int i = 0; i < cfg.chunkStart; i++) {
+    for (int i = 0; i < warmStart; i++) {
       final VizContext ctx = VizContext(
         audio: audio,
         sampleRate: cfg.sampleRate,
@@ -255,19 +330,33 @@ void _workerMain(_WorkerConfig cfg) {
     }
     final double replayMs = replaySw.elapsedMicroseconds / 1000.0;
 
-    // The trail is a real part of frame state. A serial bake enters
-    // chunkStart with the decayed accumulation of every prior frame
-    // still in the framebuffer. Suppressed replay never stamped, so
-    // this worker's canvas is empty here -- which is CORRECT ONLY if
-    // the plugin's visible trail cannot outlive the replay gap. For
-    // the ported set (Phosphor: per-frame AGC + full-window redraw,
-    // trail is pure phosphor decay of identical geometry) the trail
-    // is cosmetic persistence, not state the next frame reads back,
-    // so a cold canvas at chunk start converges within a few frames
-    // and is visually indistinguishable mid-stream. Plugins whose
-    // OUTPUT depends on reading prior framebuffer contents (none
-    // ported yet) would need warm-canvas replay; gate them out of the
-    // parallel path when they arrive.
+    // --- Part 2: trail warm-up, frames [warmStart, chunkStart) ---
+    // FULL render (decay + stamp) exactly as the real loop, but the
+    // frames are NOT written to the FIFO -- they exist only to
+    // rebuild the framebuffer trail a serial bake accumulates
+    // entering chunkStart. This is the chunk-boundary seam fix: a
+    // cold canvas here would make the trail build up from black over
+    // the first K frames of every segment. render() advances state
+    // once per frame just like renderSuppressed, so state evolution
+    // across [0, chunkStart) is identical regardless of the split
+    // point -- only the canvas is additionally warmed.
+    final Stopwatch warmupSw = Stopwatch()..start();
+    for (int i = warmStart; i < cfg.chunkStart; i++) {
+      final VizContext ctx = VizContext(
+        audio: audio,
+        sampleRate: cfg.sampleRate,
+        t: i / cfg.fps,
+        frameIndex: i,
+        dt: dt,
+        width: cfg.width,
+        height: cfg.height,
+        dampening: cfg.dampening,
+        settings: cfg.settings,
+      );
+      canvas.decay(retention, dt);
+      viz.render(canvas, ctx);
+    }
+    final double warmupMs = warmupSw.elapsedMicroseconds / 1000.0;
 
     final Stopwatch sw = Stopwatch();
     double totalRender = 0, totalWrite = 0;
@@ -276,7 +365,7 @@ void _workerMain(_WorkerConfig cfg) {
     final int chunkLen = cfg.chunkEnd - cfg.chunkStart;
     int doneInChunk = 0;
 
-    // --- Render + write the real chunk ---
+    // --- Part 3: render + write the real chunk ---
     for (int i = cfg.chunkStart; i < cfg.chunkEnd; i++) {
       final VizContext ctx = VizContext(
         audio: audio,
@@ -291,7 +380,7 @@ void _workerMain(_WorkerConfig cfg) {
       );
 
       sw..reset()..start();
-      canvas.decay(retention);
+      canvas.decay(retention, dt);
       viz.render(canvas, ctx);
       totalRender += sw.elapsedMicroseconds / 1000.0;
 
@@ -314,7 +403,7 @@ void _workerMain(_WorkerConfig cfg) {
     final double workerWallSec = wall.elapsedMicroseconds / 1e6;
     raf.closeSync();
     reply.send(('done', cfg.workerId, chunkLen, totalRender, totalWrite,
-        replayMs, workerWallSec));
+        replayMs, warmupMs, workerWallSec));
   } catch (e) {
     try {
       raf.closeSync();
@@ -461,6 +550,7 @@ class SoftBakePool {
     final List<double> perWorkerRenderMs = List<double>.filled(n, 0);
     final List<double> perWorkerWriteMs = List<double>.filled(n, 0);
     final List<double> perWorkerReplayMs = List<double>.filled(n, 0);
+    final List<double> perWorkerWarmupMs = List<double>.filled(n, 0);
     final List<double> perWorkerWallSec = List<double>.filled(n, 0);
     final List<int> perWorkerFrames = List<int>.filled(n, 0);
     String? firstError;
@@ -479,14 +569,15 @@ class SoftBakePool {
           }
           onProgress(sum, totalFrames);
         }
-      } else if (msg is (String, int, int, double, double, double, double) &&
+      } else if (msg is (String, int, int, double, double, double, double, double) &&
           msg.$1 == 'done') {
         final int id = msg.$2;
         perWorkerFrames[id] = msg.$3;
         perWorkerRenderMs[id] = msg.$4;
         perWorkerWriteMs[id] = msg.$5;
         perWorkerReplayMs[id] = msg.$6;
-        perWorkerWallSec[id] = msg.$7;
+        perWorkerWarmupMs[id] = msg.$7;
+        perWorkerWallSec[id] = msg.$8;
         perWorkerDone[id] = msg.$3;
         if (!doneC[id].isCompleted) doneC[id].complete();
       } else if (msg is String && msg.startsWith('error:')) {
@@ -645,7 +736,8 @@ class SoftBakePool {
       int framesRendered = 0;
       double weightedRender = 0, weightedWrite = 0;
       double sumReplay = 0, maxReplay = 0;
-      double sumBusySec = 0; // sum of per-worker (render+write) wall
+      double sumWarmup = 0, maxWarmup = 0;
+      double sumBusySec = 0; // sum of per-worker (warmup + render+write) wall
       for (int i = 0; i < n; i++) {
         framesRendered += perWorkerFrames[i];
         weightedRender += perWorkerRenderMs[i];
@@ -654,14 +746,23 @@ class SoftBakePool {
         if (perWorkerReplayMs[i] > maxReplay) {
           maxReplay = perWorkerReplayMs[i];
         }
-        sumBusySec += perWorkerWallSec[i];
+        sumWarmup += perWorkerWarmupMs[i];
+        if (perWorkerWarmupMs[i] > maxWarmup) {
+          maxWarmup = perWorkerWarmupMs[i];
+        }
+        // Warm-up is genuine rasterization keeping a core busy, so it
+        // counts toward busy time; only the scan-only suppressed
+        // replay is excluded.
+        sumBusySec += perWorkerWallSec[i] + perWorkerWarmupMs[i] / 1000.0;
       }
       final double invFrames =
           framesRendered > 0 ? 1.0 / framesRendered : 0.0;
 
       // Parallel efficiency: how much of (wall * workers) core-time
-      // was actually spent working. sumBusySec is the total worker
-      // render+write wall across the pool; wallSec*n is the core-time
+      // was actually spent on productive rasterization. sumBusySec is
+      // each worker's real render+write wall PLUS its warm-up render
+      // time (both are genuine rasterization; only the scan-only
+      // suppressed replay is excluded). wallSec*n is the core-time
       // budget the pool occupied. 1.0 = every core busy the whole
       // wall; lower = idle cores (starvation or a straggler holding
       // the wall past when others finished).
@@ -676,10 +777,13 @@ class SoftBakePool {
         avgWriteWaitMs: weightedWrite * invFrames,
         avgReplayMs: n > 0 ? sumReplay / n : 0.0,
         maxReplayMs: maxReplay,
+        avgWarmupMs: n > 0 ? sumWarmup / n : 0.0,
+        maxWarmupMs: maxWarmup,
         parallelEfficiency: efficiency,
         perWorkerRenderMs: perWorkerRenderMs,
         perWorkerWriteMs: perWorkerWriteMs,
         perWorkerReplayMs: perWorkerReplayMs,
+        perWorkerWarmupMs: perWorkerWarmupMs,
         perWorkerWallSec: perWorkerWallSec,
       );
 

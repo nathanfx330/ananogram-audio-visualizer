@@ -205,6 +205,9 @@ The system is optimized for long-duration synthesis rather than interactive play
 * Frame-rate-independent smoothing using continuous-time decay functions
 * Unified preview/export evaluation model
 
+* **Future update — pull floor-decay off the live compositor.**
+  The real structural fix. Restores the fixed point so sustained playback goes quiescent, which means you could go back to vsync-rate live rendering and keep the GC happy, because idle scenes stop minting textures on their own. This is the one that actually dissolves the tradeoff instead of trading against it — but it's the two-file change (`soft_raster.dart` + `visualization.dart`) and it reintroduces the cosmetic preview/export haze mismatch at high retention.
+
 ### Performance
 
 * Batched GPU rendering pipeline

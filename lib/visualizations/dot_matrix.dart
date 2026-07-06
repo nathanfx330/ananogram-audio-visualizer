@@ -31,6 +31,8 @@ class DotMatrixSpectrum implements Visualization {
     final double logLo = math.log(20.0);
     final double logHi = math.log(16000.0);
     final WaveformSettings s = ctx.settings;
+    
+    final double tSm = math.pow(smoothing, 30.0 * ctx.dt).toDouble();
 
     // Calculate grid spacing
     final double dotSize = (w / columns) * 0.6;
@@ -59,7 +61,7 @@ class DotMatrixSpectrum implements Visualization {
       }
 
       double level = (math.pow(peak, 0.55).toDouble() * ctx.dampening).clamp(0.0, 1.0);
-      _levels[c] = _levels[c] * smoothing + level * (1.0 - smoothing);
+      _levels[c] = _levels[c] * tSm + level * (1.0 - tSm);
 
       final int litRows = (_levels[c] * rows).round();
       final double x = xGap + c * (dotSize + xGap);
