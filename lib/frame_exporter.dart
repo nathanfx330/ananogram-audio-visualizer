@@ -28,17 +28,31 @@
 // about WHERE the format-specific alpha work runs:
 //
 //   Segments are encoded LOSSLESS with alpha preserved (FFV1 in
-//   yuva444p). No unpremultiply, no matte extraction, no black
-//   composite, no ProRes conversion happens per-segment -- segments
-//   are a faithful, lossless carrier of the exact premultiplied RGBA
-//   the workers stamped. ALL format-specific alpha handling runs
-//   ONCE, in a single final pass, on the concatenated intermediate.
+//   gbrap -- planar RGB + alpha). No unpremultiply, no matte
+//   extraction, no black composite, no ProRes conversion happens
+//   per-segment -- segments are a faithful, bit-exact carrier of the
+//   premultiplied RGBA the workers stamped. ALL format-specific alpha
+//   handling runs ONCE, in a single final pass, on the concatenated
+//   intermediate.
+//
+//   WHY gbrap AND NOT yuva444p: FFV1 is lossless over whatever pixel
+//   format it is handed, but rgba -> yuva444p is itself a LOSSY
+//   colorspace conversion at 8 bits -- the RGB<->YUV matrices do not
+//   round-trip bit-exactly, so segments encoded through YUV reach the
+//   final pass slightly perturbed relative to what the GPU path feeds
+//   its inline graphs. That was the known CPU/GPU pixel divergence.
+//   gbrap is FFV1-native planar RGB with alpha: rgba -> gbrap is a
+//   pure channel reshuffle, zero arithmetic, so the final pass sees
+//   byte-identical input on both render paths. Cost: RGB compresses
+//   worse than YUV under FFV1, so the transient intermediates are
+//   somewhat larger. They are deleted after the final pass; the size
+//   is rented, the correctness is kept.
 //
 // This keeps the pool dumb (render -> lossless segment, nothing
 // format-aware) and confines every alpha decision to one place -- the
 // _finalPassArgs builder -- which runs the SAME filtergraphs the GPU
 // path uses inline, just relocated to the end of the CPU pipeline.
-// The cost is large temporary intermediates (lossless 4:4:4+alpha),
+// The cost is large temporary intermediates (lossless RGB + alpha),
 // but they are transient and deleted after the final pass. Because
 // the alpha survives losslessly to the final pass, lumaMatte's matte
 // is generated there from the intermediate's own alpha plane -- no
@@ -827,10 +841,19 @@ class FrameExporter {
   /// FFV1 segment args: raw rgba from the worker's FIFO in, one
   /// lossless-alpha video-only segment out. No filtergraph, no audio,
   /// no format-specific work -- segments are a faithful carrier of
-  /// the premultiplied RGBA the worker stamped. yuva444p keeps all
-  /// four channels lossless so the final pass can do straight-alpha
-  /// math correctly. Every segment uses identical settings, so the
-  /// concat demuxer stream-copies them frame-exact.
+  /// the premultiplied RGBA the worker stamped.
+  ///
+  /// gbrap (FFV1-native planar RGB + alpha) is the pixel format
+  /// because rgba -> gbrap is a pure channel reshuffle -- zero
+  /// arithmetic, bit-exact. The previous yuva444p choice was NOT
+  /// lossless end-to-end: FFV1 encoded the YUV losslessly, but the
+  /// rgba -> yuva444p conversion in front of it is lossy at 8 bits
+  /// (RGB<->YUV matrices don't round-trip), which was the source of
+  /// the CPU/GPU pixel divergence. With gbrap the final pass sees
+  /// byte-identical input on both render paths. Segments are somewhat
+  /// larger (RGB compresses worse than YUV) but transient. Every
+  /// segment uses identical settings, so the concat demuxer
+  /// stream-copies them frame-exact.
   List<String> _segmentArgs(
       String fifoPath, String segmentPath, int chunkFrames,
       {required int fps, required int width, required int height}) {
@@ -847,7 +870,7 @@ class FrameExporter {
       '-frames:v', '$chunkFrames',
       '-c:v', 'ffv1',
       '-level', '3',
-      '-pix_fmt', 'yuva444p',
+      '-pix_fmt', 'gbrap',
       '-threads', _ffv1Threads,
       '-an',
       segmentPath,

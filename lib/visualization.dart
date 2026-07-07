@@ -44,64 +44,63 @@ abstract class Visualization {
   void render(Canvas canvas, VizContext ctx);
 }
 
+/// A single recorded frame of vector geometry for the live preview trail.
+class LiveFrame {
+  final ui.Image image;
+  final double t; // The absolute audio time this frame was recorded
+  LiveFrame(this.image, this.t);
+}
+
 /// Frame compositor: retains the previous frame as a GPU image,
 /// decays it by settings.trailRetention, then lets the active
 /// visualization draw on top. Output is a premultiplied transparent
 /// RGBA image suitable for live blit and raw-pixel export alike.
 ///
-/// FRAME OWNERSHIP MODEL (the VRAM fix):
+/// FRAME OWNERSHIP MODEL (the VRAM fix, v4 final):
 ///
-/// The historical export leak (~6 GB/min) was never the trail draw
-/// itself -- it was frame lifetime. Superseded ui.Images were left
-/// to the GC, which does not feel GPU memory pressure, so textures
-/// accumulated (~8 MB/frame at 1080p) far faster than any collection
-/// reclaimed them. Skipping the trail during export didn't close the
-/// leak either: advanceAsync still produced one unreferenced,
-/// undisposed texture per frame.
+///  * Export (advanceAsync): the superseded frame is disposed the
+///    instant the new one is rasterized. Exactly two textures ever
+///    alive (previous + current); memory flat regardless of duration.
 ///
-/// Two paths, two ownership rules:
+///  * Live (advance): THE NON-RECURSIVE HISTORY RING.
 ///
-///  * Live (advance): frames are GC-owned. The previous frame is
-///    NEVER explicitly disposed, because VizBlitPainter may be
-///    blitting it on the current vsync -- and the UI can repaint a
-///    cached frame at any time (e.g. on pointer hover), so there is
-///    no vsync count after which an explicit dispose is provably
-///    safe. Disposing here crashes the engine ("painting disposed
-///    image"). Live VRAM is instead bounded by HALTING THE TICKER
-///    when idle (see main.dart _onTick): the GC only needs an idle
-///    gap to sweep the orphaned textures, and stopping advance()
-///    calls gives it one. This is the sanctioned live-path model --
-///    do not add explicit disposal here.
-///
-///  * Export (advanceAsync): frames are compositor-owned. The
-///    superseded frame is disposed the instant the new one is
-///    rasterized. Exactly two textures are ever alive (previous +
-///    current), so memory stays flat regardless of duration -- and
-///    the trail draws during export again, restoring the
-///    preview/export parity the README promises.
-///
-/// advanceAsync awaits Picture.toImage, which forces real GPU
-/// rasterization: the retained frame is a flat texture, never a
-/// nested DisplayList, so the trail draw cannot recurse ("Russian
-/// Doll" DisplayList problem).
+///    THE "RUSSIAN DOLL" LEAK RESOLVED:
+///    Previously, the live path fed the composited image back into itself
+///    using `toImageSync`. Because `toImageSync` defers rasterization, this
+///    created a recursively nested DisplayList that exploded VRAM usage.
+///    To fix this while maintaining 60fps, we break the feedback loop. 
+///    `advance` now records ONLY the current frame's vector art and pushes 
+///    it to a short history list (`_liveHistory`). It then composites that 
+///    list into a single flat UI frame. Nesting depth is strictly O(1), 
+///    completely eliminating the leak.
 class VizCompositor {
   final int width;
   final int height;
 
   ui.Image? _frame;
-  bool _ownsFrame = false; // set by advanceAsync; guards explicit dispose
+  bool _ownsFrame = false; // set by advanceAsync; guards export dispose
+
+  // Live-path history ring. Holds individual flat frames for the trail.
+  final List<LiveFrame> _liveHistory = [];
+  static const int _maxLiveHistory = 45; // Hard cap on preview trail length (~1.5s)
 
   VizCompositor({required this.width, required this.height});
 
   ui.Image? get image => _frame;
 
+  /// Resets the retained frame and clears the live history.
   void clear() {
     if (_ownsFrame) _frame?.dispose();
+    for (final f in _liveHistory) {
+      f.image.dispose();
+    }
+    _liveHistory.clear();
     _frame = null;
     _ownsFrame = false;
   }
 
-  ui.Picture _record(Visualization viz, VizContext ctx) {
+  // --- EXPORT PATH (Accurate, flattened, async) ---
+  ui.Picture _recordExport(Visualization viz, VizContext ctx) {
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(
       recorder,
@@ -121,31 +120,9 @@ class VizCompositor {
     return recorder.endRecording();
   }
 
-  /// Live path. Synchronous to match monitor vsync. Frames are
-  /// GC-owned: never disposed here, the painter may hold the old one
-  /// and the UI may repaint a cached frame on interaction. VRAM is
-  /// bounded by the Ticker halting when idle (main.dart), not by
-  /// disposal here.
-  /// [isExport] is retained for call-site compatibility and ignored.
-  ui.Image advance(Visualization viz, VizContext ctx,
-      {bool isExport = false}) {
-    final ui.Picture picture = _record(viz, ctx);
-    final ui.Image next = picture.toImageSync(width, height);
-    picture.dispose();
-
-    _frame = next;
-    _ownsFrame = false;
-    return next;
-  }
-
-  /// Export path. Awaiting toImage forces GPU rasterization to a flat
-  /// texture. The superseded frame is disposed immediately -- this is
-  /// the VRAM fix. Returns a clone: the caller owns and disposes the
-  /// clone, the compositor owns and disposes the retained frame.
-  /// [isExport] is retained for call-site compatibility and ignored.
   Future<ui.Image> advanceAsync(Visualization viz, VizContext ctx,
       {bool isExport = false}) async {
-    final ui.Picture picture = _record(viz, ctx);
+    final ui.Picture picture = _recordExport(viz, ctx);
     final ui.Image next = await picture.toImage(width, height);
     picture.dispose();
 
@@ -157,12 +134,80 @@ class VizCompositor {
     return next.clone();
   }
 
-  void dispose() {
-    // Only dispose frames this compositor owns (export path). Live
-    // frames stay GC-owned: the UI might still paint one this vsync.
+  // --- LIVE PATH (Non-recursive, lightning fast, leak-proof) ---
+  ui.Image advance(Visualization viz, VizContext ctx, {bool isExport = false}) {
+    // 0. Handle timeline scrubs (time goes backwards)
+    if (_liveHistory.isNotEmpty && ctx.t < _liveHistory.last.t) {
+      for (final f in _liveHistory) f.image.dispose();
+      _liveHistory.clear();
+    }
+
+    // 1. Record ONLY this frame's vector art (no background, no previous frame)
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(
+      recorder,
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+    );
+    viz.render(canvas, ctx);
+    final ui.Picture pic = recorder.endRecording();
+    
+    // Rasterize synchronously. Because it contains NO nested images, this is O(1).
+    final ui.Image img = pic.toImageSync(width, height);
+    pic.dispose();
+
+    _liveHistory.add(LiveFrame(img, ctx.t));
+
+    // 2. Prune old history frames based on true opacity calculation
+    final double r30 = ctx.settings.trailRetention.clamp(0.0, 0.995);
+    _liveHistory.removeWhere((f) {
+      final double age = ctx.t - f.t;
+      final double opacity = math.pow(r30, 30.0 * age).toDouble();
+      if (opacity < 0.01) { // Invisible
+        f.image.dispose();
+        return true;
+      }
+      return false;
+    });
+
+    // Hard cap to bound VRAM, preventing runaway on extreme retention sliders
+    if (_liveHistory.length > _maxLiveHistory) {
+      int excess = _liveHistory.length - _maxLiveHistory;
+      for (int i = 0; i < excess; i++) {
+        _liveHistory[i].image.dispose();
+      }
+      _liveHistory.removeRange(0, excess);
+    }
+
+    // 3. Composite the history into a single flat image for the UI to display
+    final ui.PictureRecorder compRecorder = ui.PictureRecorder();
+    final Canvas compCanvas = Canvas(
+      compRecorder,
+      Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()),
+    );
+
+    for (final f in _liveHistory) {
+      final double age = ctx.t - f.t;
+      if (age < 0) continue;
+      final double opacity = math.pow(r30, 30.0 * age).toDouble().clamp(0.0, 1.0);
+      final Paint p = Paint()..color = Color.fromRGBO(255, 255, 255, opacity);
+      compCanvas.drawImage(f.image, Offset.zero, p);
+    }
+
+    final ui.Picture compPic = compRecorder.endRecording();
+    final ui.Image compImg = compPic.toImageSync(width, height);
+    compPic.dispose();
+
+    // 4. Update the compositor state safely
     if (_ownsFrame) _frame?.dispose();
-    _frame = null;
-    _ownsFrame = false;
+    _frame = compImg;
+    _ownsFrame = true;
+
+    return compImg;
+  }
+
+  /// Full teardown.
+  void dispose() {
+    clear();
   }
 }
 

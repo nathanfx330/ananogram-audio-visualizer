@@ -162,14 +162,39 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
 
   // Live-preview render throttle. The Ticker fires at monitor vsync
   // (60/120/144 Hz), but the preview is a monitor, not the
-  // deliverable -- 30fps of distinct frames is imperceptible for a
+  // deliverable -- ~30fps of distinct frames is imperceptible for a
   // scope. Capping the LIVE render rate caps how fast orphaned
   // GC-owned textures are minted during playback, which (with the
   // continuous-time floor decay) no longer reach a fixed point and so
   // must not be produced every vsync. Export is unaffected: it never
-  // touches this path. dt still accumulates every tick so the decay
-  // math stays wall-accurate; only advance() is gated.
-  static const double _liveRenderIntervalSec = 1.0 / 30.0;
+  // touches this path.
+  //
+  // TWO SUBTLETIES, both learned the hard way:
+  //
+  //  1. The dt handed to VizContext must be the time since the last
+  //     RENDERED frame, not the per-tick dt. Every temporal recurrence
+  //     (trail decay, AGC, plugin smoothing) is pow(x, 30*dt) -- feed
+  //     it the 16.7ms tick dt while rendering every ~33ms and all time
+  //     constants run at half speed: trails linger, smoothing drags,
+  //     and the preview no longer matches export. _sinceLiveRender IS
+  //     that accumulated value; it is captured as renderDt before the
+  //     reset and passed to the context.
+  //
+  //  2. The threshold sits BELOW the exact 2-tick sum, not at it.
+  //     1/30 vs two 60Hz ticks is a float-equality knife edge: renders
+  //     alternate between landing on tick 2 (33ms) and slipping to
+  //     tick 3 (50ms), and the phase wanders -- textbook judder, more
+  //     visible than a clean constant 30fps. 0.030s is safely under
+  //     2/60 and over 1/60, so 60Hz locks to every 2nd vsync (~30fps),
+  //     120Hz to every 4th, 144Hz to every 5th (~28.8fps). Constant
+  //     cadence at the cost of the cap being "about 30" instead of
+  //     exactly 30 -- the right trade for a preview.
+  //
+  // A forced render (viz switch, scrub, settings change) zeroes
+  // _timeSincePaused, which does NOT reset this accumulator, so it
+  // lands on the next slot within at most one interval -- visually
+  // immediate.
+  static const double _liveRenderIntervalSec = 0.030;
   double _sinceLiveRender = 0.0;
 
   // --- Export ---
@@ -259,17 +284,13 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
       }
     }
 
-    // Throttle the live render to _liveRenderIntervalSec. The Ticker
-    // still fires every vsync (and dt above stays accurate), but we
-    // only mint a new frame/texture at the capped rate -- bounding the
-    // rate of GC-owned texture churn during playback. A forced render
-    // (viz switch, scrub, settings change) zeroes _timeSincePaused,
-    // which does NOT reset this accumulator, so it lands on the next
-    // slot within at most one interval -- visually immediate.
+    // Throttle gate (see the comment at _liveRenderIntervalSec).
     _sinceLiveRender += dt;
     if (wantsRender && _sinceLiveRender < _liveRenderIntervalSec) {
       return;
     }
+    
+    final double renderDt = _sinceLiveRender;
     _sinceLiveRender = 0.0;
 
     if (wantsRender && _viewW > 0 && _viewH > 0) {
@@ -279,12 +300,13 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
         sampleRate: _sampleRate,
         t: _currentTime,
         frameIndex: _frameCounter,
-        dt: dt,
+        dt: renderDt,
         width: _viewW,
         height: _viewH,
         dampening: _dampening,
         settings: _settings,
       );
+
       _compositor!.advance(_viz, ctx);
       _frameCounter++;
 
