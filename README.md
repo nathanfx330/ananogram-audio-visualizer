@@ -71,12 +71,14 @@ Although implemented independently, both pipelines evaluate identical visualizat
 
 ## Deterministic by Design
 
-* Frame-perfect reproducibility
+* Bit-identical output across repeated exports at the same framerate
 * Continuous-time evaluation rather than frame-dependent simulation
-* Identical visual output regardless of preview or export framerate
-* Stable rendering across machines and repeated exports
+* Framerate-independent visuals: 30 fps and 60 fps exports look identical
+* No simulation drift between preview and final render
 
-Every visualization is evaluated as a function of time instead of frame number. This eliminates simulation drift and preserves visual parity between live playback and rendered output.
+Every visualization is evaluated as a function of time instead of frame number, using pure arithmetic on typed data with no GPU or engine involvement. Repeated exports at the same settings are byte-for-byte identical.
+
+Framerate independence is a separate, visual guarantee rather than a bit-exact one: temporal recurrences are evaluated as `pow(x, 30·dt)` so time constants stay fixed in seconds, but the 8-bit trail decay accumulates marginally different truncation per frame at different rates—imperceptible in the image, not byte-equal in the faintest tail.
 
 ---
 
@@ -135,7 +137,7 @@ FFT computation is performed lazily, ensuring plugins that do not require freque
 * **Ridge Plot (Waterfall)** — scrolling spectral history
 * **Dot Matrix** — LED/VFD-style equalizer
 * **Minimalist Halo** — circular low-frequency energy field
-* **Vocal Telemetry** — forensic polygraph-style voice analysis
+* **Vocal Telemetry (Forensic)** — forensic polygraph-style voice analysis
 * **Voiceprint Spectrogram** — frequency-over-time heatmap
 * **Terminal Waves** — additive harmonic interference rendered on an ASCII grid
 
@@ -161,19 +163,17 @@ Its goal is responsiveness rather than maximum rendering throughput.
 
 ## Production Export Engine
 
-Export bypasses the GPU entirely.
+Export runs on a dedicated pure-Dart software rasterizer (`SoftCanvas`), distributing rendering across available CPU cores. When every active plugin has a software port—the current default—export bypasses the GPU entirely; a plugin without a software implementation falls back to the GPU render path automatically.
 
-A dedicated software rasterizer (`SoftCanvas`) distributes rendering across available CPU cores.
-
-Each worker renders independent frame ranges into isolated POSIX FIFOs, streaming lossless FFV1 segments directly into FFmpeg before performing frame-accurate concatenation.
+Each worker renders a contiguous frame range and streams raw RGBA directly into its own FFmpeg process, which encodes a lossless FFV1 segment. The segments are then stitched by frame-accurate concatenation (stream copy, no re-encode) and the audio is muxed in a single final pass.
 
 This architecture provides:
 
 * Linear scaling with CPU cores
-* Constant memory usage
-* No image sequence intermediates
+* Constant memory usage, independent of clip length
+* No PNG/image-sequence intermediates
 * Deterministic output
-* Backpressure-aware streaming
+* Backpressure-aware streaming (the OS pipe blocks each worker when its encoder falls behind)
 
 Interactive rendering and production rendering solve different optimization problems and therefore use different implementations while sharing the same visualization model.
 
@@ -181,23 +181,25 @@ Interactive rendering and production rendering solve different optimization prob
 
 # Export System
 
-Exports stream directly through FFmpeg into production-ready formats.
+Exports stream through FFmpeg into production-ready deliverables.
 
-Supported formats include:
+Supported formats:
 
-* ProRes 4444 (straight alpha)
-* H.264 with luma matte
-* H.264 solid black background
-* Experimental NVENC hardware encoding
+* **ProRes 4444** — straight-alpha, for the widest compositor compatibility
+* **H.264 + luma matte** — a fill/matte pair reconstructed as fill × matte
+* **H.264 over a solid background** — any background color; black composites by dropping the alpha plane, other colors are composited over a generated source
 
-Every export also generates a JSON sidecar containing:
+For the two H.264 paths, NVENC hardware encoding is available as an experimental opt-in; CPU (`libx264`) is the default and the known-good path. NVENC is an encoder choice, not a separate format, and does not apply to ProRes.
 
-* Project hash
-* Renderer version
-* Visualization configuration
+Every export also writes a JSON sidecar next to the video, recording everything needed to reproduce the bake:
+
+* Source and output paths
+* Renderer path (CPU or GPU) and schema version
+* Visualization name and full style block
 * Plugin parameters
+* Format, codec, framerate, and geometry
 * Performance telemetry
-* Export metadata
+* Creation timestamp
 
 This allows rendered assets to be reproduced exactly at a later date.
 
@@ -206,9 +208,9 @@ This allows rendered assets to be reproduced exactly at a later date.
 # Current Limitations
 
 * Linux only
-* POSIX-based rendering pipeline
+* Export pipeline depends on POSIX named FIFOs (`mkfifo`)
 * FFmpeg required
-* Experimental NVENC support
+* NVENC support is experimental
 
 ---
 
