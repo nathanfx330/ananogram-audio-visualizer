@@ -56,7 +56,7 @@ Interactive   Parallel Batch
            ↓
 Compositing
            ↓
-Production-ready Plates
+Finishing
 ```
 
 The preview renderer prioritizes responsiveness, smooth interaction, and immediate visual feedback.
