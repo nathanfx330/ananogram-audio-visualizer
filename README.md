@@ -92,7 +92,7 @@ Features include:
 
 * Premultiplied alpha correctness throughout the pipeline
 * ProRes 4444 straight alpha workflows
-* H.264 luma matte workflows
+* H.264 color + matte workflows
 * Frame-accurate deterministic exports
 * Metadata sidecars for reproducibility
 
