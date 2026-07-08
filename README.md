@@ -2,254 +2,259 @@
 
 **A modern audiovisual synthesis engine for motion graphics, broadcast, and post-production.**
 
-Ananogram revives music visualization as a serious creative medium—built not as a consumer effect or real-time toy, but as a deterministic system for generating sound-driven visual material inside professional production pipelines.
+Ananogram revives music visualization as a serious creative medium—not as a consumer effect or real-time toy, but as a deterministic system for generating sound-driven visual material inside professional production pipelines.
 
-It produces *visual artifacts*, not finished videos: clean, composable plates designed to live inside After Effects, Fusion, Nuke, Blender, Resolve, and any compositor that expects precision.
-
----
-
-## Core Idea
-
-There was a time when audio visualization was experimental—systems that treated sound as a direct driver of visual form. Over time, that space collapsed into presets, templates, and shallow real-time effects.
-
-Ananogram brings it back in a form that fits modern production reality:
-
-* Sound becomes structure
-* Structure becomes visual form
-* Visual form becomes reusable production material
-
-Not reactive decoration. Not playback gimmicks. A synthesis system.
+It produces *visual artifacts*, not finished videos: clean, composable plates designed for use in After Effects, Fusion, Nuke, Blender, Resolve, and any compositor that expects precision.
 
 ---
 
-## System Overview
+# Core Idea
 
-Ananogram is a deterministic offline renderer for audio-driven visual systems.
+Modern audio visualization has largely converged on playback effects, templates, and live performance tools.
 
-It turns audio into frame-accurate visual outputs through a fully reproducible pipeline:
+Ananogram approaches the problem differently.
+
+It treats audio as structured input for visual synthesis.
+
+```text
+Sound
+    ↓
+Structure
+    ↓
+Visual Form
+    ↓
+Production Material
+```
+
+Rather than decorating playback, Ananogram synthesizes reusable visual assets that become part of a larger compositing workflow.
+
+---
+
+# System Overview
+
+Ananogram is a deterministic audiovisual synthesis engine with separate architectures for interactive preview and production export.
+
+Both pipelines evaluate the exact same visualization model, but each is optimized for a different engineering problem.
 
 ```text
 Audio
-  ↓
+    ↓
 Decoding (WAV / FFmpeg)
-  ↓
-Signal Analysis (FFT + envelope + bands)
-  ↓
-Visualization System (plugin-driven)
-  ↓
-Frame Renderer (GPU)
-  ↓
-Compositing Layer (alpha-correct)
-  ↓
-Streaming Export (FFmpeg via pipe)
-  ↓
-Production-ready plates
+    ↓
+Signal Analysis
+(FFT • Envelope • Bands)
+    ↓
+Visualization Plugin
+(Time-based Evaluation)
+           │
+    ┌──────┴──────┐
+    │             │
+GPU Preview   CPU Export
+    │             │
+Interactive   Parallel Batch
+    └──────┬──────┘
+           ↓
+Compositing
+           ↓
+Production-ready Plates
 ```
 
-Every stage is deterministic. Identical input produces identical output at any time, on any machine.
+The preview renderer prioritizes responsiveness, smooth interaction, and immediate visual feedback.
+
+The export renderer prioritizes throughput, determinism, compositing fidelity, and efficient multi-core utilization.
+
+Although implemented independently, both pipelines evaluate identical visualization logic, ensuring visual consistency between preview and final output.
 
 ---
 
-## Key Properties
+# Key Properties
 
-### Deterministic by design
+## Deterministic by Design
 
 * Frame-perfect reproducibility
-* Time-based evaluation instead of frame-dependent simulation
-* No real-time state drift between preview and export
+* Continuous-time evaluation rather than frame-dependent simulation
+* Identical visual output regardless of preview or export framerate
+* Stable rendering across machines and repeated exports
 
-### Post-production native
-
-* Outputs are designed for compositing, not playback
-* Alpha-aware rendering pipeline (premultiplied correctness preserved end-to-end)
-* EXR / ProRes / H.264 workflows supported
-
-### Offline synthesis, not playback
-
-* No live timing constraints
-* No UI-driven simulation loop
-* Rendering is a batch synthesis process
+Every visualization is evaluated as a function of time instead of frame number. This eliminates simulation drift and preserves visual parity between live playback and rendered output.
 
 ---
 
-## Visualization System
+## Professional Compositing Workflow
 
-Ananogram is built around modular visualization plugins.
+Ananogram generates production assets rather than presentation media.
 
-Each plugin is a small deterministic function:
+Its output is intended for compositing inside professional post-production applications.
 
-```text
-render(audio_context, visual_state, time) → frame
-```
+Features include:
 
-Plugins do not “play audio.” They *interpret structure over time*.
-
-### Included systems
-
-* **Phosphor Waveform** – persistent analog-style oscilloscope rendering
-* **Spectrum Bars** – logarithmic frequency decomposition (20 Hz–16 kHz)
-* **Circular Spectrum** – radial harmonic geometry
-* **Ridge Plot** – spectral history as spatial form
-* **Dot Matrix** – grid-based amplitude encoding
-* **Bass Halo** – low-frequency energy field visualization
-
-Each system can operate with or without FFT input, allowing zero-cost rendering paths when analysis is unnecessary.
+* Premultiplied alpha correctness throughout the pipeline
+* ProRes 4444 straight alpha workflows
+* H.264 luma matte workflows
+* Frame-accurate deterministic exports
+* Metadata sidecars for reproducibility
 
 ---
 
-## Audio Pipeline
+## Interactive Authoring
 
-* WAV decoding implemented in pure Dart (full RIFF support)
-* FFmpeg-backed decoding for all production formats (MP3, FLAC, OGG, M4A, etc.)
-* Internal normalization to mono Float32 @ 44.1 kHz
-* Polyphase sinc resampling for sample-accurate alignment
+Real-time preview is a first-class part of the system.
 
-Audio is not treated as playback—it is treated as a data source.
+The interactive renderer provides responsive editing, parameter adjustment, synchronized playback, and GPU-accelerated visualization while sharing the same deterministic evaluation model used during export.
 
----
-
-## Rendering Architecture
-
-Ananogram separates analysis, rendering, and export into isolated deterministic layers.
-
-```text
-Analysis Layer
-  - FFT (lazy, cached)
-  - envelope tracking
-  - band energy extraction
-
-↓
-
-Visualization Layer
-  - plugin evaluation
-  - time-based state resolution
-
-↓
-
-Frame Compositor
-  - GPU rasterization
-  - alpha correctness enforcement
-  - controlled texture lifetime (constant VRAM footprint)
-
-↓
-
-Export Layer
-  - named pipe streaming
-  - FFmpeg encoding
-  - zero intermediate files
-```
-
-The system is designed so memory usage and output correctness do not degrade with duration.
+Interactive performance and export performance are treated as separate optimization problems rather than competing requirements within a single renderer.
 
 ---
 
-## Export System
+# Visualization System
 
-Ananogram exports directly into production formats via FFmpeg streaming pipelines.
+Visualization is built around modular deterministic plugins.
 
-### Supported outputs
+Each plugin maps analyzed audio features into visual geometry through continuous-time evaluation.
 
-* ProRes 4444 (alpha preserved)
-* H.264 (black background or matte-separated workflows)
-* NVENC hardware encoding (experimental, opt-in)
-* PNG / EXR sequences (planned / extensible)
+Plugins receive structured analysis data rather than raw audio, allowing each visualization to operate independently of the decoding pipeline.
 
-### Key properties
+Typical inputs include:
 
-* No image sequence intermediates required
-* Backpressure-aware pipe writer (constant memory usage)
-* Frame-accurate encoding
-* Full metadata sidecar for reproducibility
+* Current playback time
+* Delta time
+* Waveform samples
+* FFT spectrum
+* Frequency bands
+* Envelope data
+* User parameters
 
-Each export produces a JSON descriptor containing:
+FFT computation is performed lazily, ensuring plugins that do not require frequency-domain analysis incur no unnecessary processing cost.
 
-* audio source hash
-* plugin configuration
-* render parameters
-* resolution and frame rate
-* analysis settings
+## Included Systems
 
----
-
-## Performance Model
-
-* GPU-driven frame rendering
-* Strict two-texture lifetime model (constant VRAM usage)
-* Lazy FFT computation (only when required)
-* Isolated writer thread for encoding (UI never blocks)
-
-The system is optimized for long-duration synthesis rather than interactive playback.
+* **Phosphor Waveform** — persistent analog oscilloscope rendering
+* **Spectrum Bars** — logarithmic frequency decomposition (20 Hz–16 kHz)
+* **Line Spectrum** — smooth spectral curve
+* **Circular Spectrum** — radial harmonic geometry
+* **Ridge Plot (Waterfall)** — scrolling spectral history
+* **Dot Matrix** — LED/VFD-style equalizer
+* **Minimalist Halo** — circular low-frequency energy field
+* **Vocal Telemetry** — forensic polygraph-style voice analysis
+* **Voiceprint Spectrogram** — frequency-over-time heatmap
+* **Terminal Waves** — additive harmonic interference rendered on an ASCII grid
 
 ---
 
-## Current Limitations
+# Rendering Architecture
 
-* **Frame-rate-dependent smoothing**
-  Some temporal parameters are currently applied per-frame instead of per-second, leading to slight differences between preview and export at different frame rates.
+Ananogram intentionally separates interactive rendering from production rendering.
 
-* **GPU dispatch overhead**
-  Rendering currently incurs per-frame round-trip latency (~40ms at 720p), which limits export throughput.
+## Live Preview Engine
 
-* **Linux-only**
-  Built around POSIX assumptions (FIFO pipelines, audio backends, tooling).
+The preview renderer is GPU-accelerated and optimized for authoring.
 
-* **Hardware encoding experimental**
-  NVENC support exists but is not yet production-stable.
+Features include:
 
----
+* Smooth real-time playback
+* Immediate parameter updates
+* Stable history buffers
+* Zero recursive display structures
+* Constant VRAM usage
 
-## Roadmap
+Its goal is responsiveness rather than maximum rendering throughput.
 
-### Temporal correctness
+## Production Export Engine
 
-* Frame-rate-independent smoothing using continuous-time decay functions
-* Unified preview/export evaluation model
+Export bypasses the GPU entirely.
 
-* **Future update — pull floor-decay off the live compositor.**
-  The real structural fix. Restores the fixed point so sustained playback goes quiescent, which means you could go back to vsync-rate live rendering and keep the GC happy, because idle scenes stop minting textures on their own. This is the one that actually dissolves the tradeoff instead of trading against it — but it's the two-file change (`soft_raster.dart` + `visualization.dart`) and it reintroduces the cosmetic preview/export haze mismatch at high retention.
+A dedicated software rasterizer (`SoftCanvas`) distributes rendering across available CPU cores.
 
-### Performance
+Each worker renders independent frame ranges into isolated POSIX FIFOs, streaming lossless FFV1 segments directly into FFmpeg before performing frame-accurate concatenation.
 
-* Batched GPU rendering pipeline
-* Reduced per-frame dispatch overhead
-* Optional compute-shader-based signal processing
+This architecture provides:
 
-### Visual expansion
+* Linear scaling with CPU cores
+* Constant memory usage
+* No image sequence intermediates
+* Deterministic output
+* Backpressure-aware streaming
 
-* Spectrogram renderer
-* Beat/onset detection system
-* Stereo and multi-channel spatial analysis
-* Expanded plugin ecosystem
-
-### Pipeline expansion
-
-* EXR-first HDR workflows
-* Open plugin SDK
-* Cross-compositor preset exchange format
+Interactive rendering and production rendering solve different optimization problems and therefore use different implementations while sharing the same visualization model.
 
 ---
 
-## Requirements
+# Export System
 
-* Linux (primary platform)
-* Flutter desktop runtime
-* FFmpeg available on PATH
-* mkfifo (standard POSIX support)
+Exports stream directly through FFmpeg into production-ready formats.
 
-Optional:
+Supported formats include:
 
-* paplay / aplay (audio preview)
-* zenity / kdialog (file dialogs)
+* ProRes 4444 (straight alpha)
+* H.264 with luma matte
+* H.264 solid black background
+* Experimental NVENC hardware encoding
+
+Every export also generates a JSON sidecar containing:
+
+* Project hash
+* Renderer version
+* Visualization configuration
+* Plugin parameters
+* Performance telemetry
+* Export metadata
+
+This allows rendered assets to be reproduced exactly at a later date.
 
 ---
 
-## Design Intent
+# Current Limitations
 
-Ananogram is not a “music video maker.”
+* Linux only
+* POSIX-based rendering pipeline
+* FFmpeg required
+* Experimental NVENC support
 
-It is a system for generating audiovisual material as a compositional medium—something closer to an instrument than a template engine, and closer to a renderer than a player.
+---
 
-It exists to rebuild a category that once existed in a fragmented form, and to make it usable inside modern production environments without stripping away its expressive core.
+# Roadmap
+
+## Analysis
+
+* Beat and onset detection
+* Stereo visualization
+* Multi-channel analysis
+* Expanded feature extraction
+
+## Pipeline
+
+* OpenEXR HDR workflows
+* Open visualization SDK
+* Cross-compositor preset exchange
+* Additional production export formats
+
+---
+
+# Requirements
+
+## Required
+
+* Linux
+* Flutter Desktop
+* FFmpeg available on `PATH`
+* POSIX FIFO support (`mkfifo`)
+
+## Optional
+
+* `paplay` or `aplay`
+* `zenity` or `kdialog`
+
+---
+
+# Design Intent
+
+Ananogram is not a music video generator.
+
+It is an audiovisual synthesis engine for producing composable visual material from sound.
+
+It occupies the space between instrument, renderer, and compositing tool—treating audio as structured input for deterministic visual synthesis rather than as a trigger for playback effects.
+
+Its goal is to restore audio visualization as a serious production medium while fitting naturally into modern post-production workflows.
 
 ---
 
@@ -257,7 +262,7 @@ It exists to rebuild a category that once existed in a fragmented form, and to m
 
 MIT License
 
-Copyright (c) 2026
+Copyright (c) 2026 Nathaniel Westveer
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
