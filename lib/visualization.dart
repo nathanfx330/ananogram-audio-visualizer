@@ -24,6 +24,7 @@ import 'visualizations/phosphor_waveform.dart';
 import 'visualizations/ridge_plot.dart';
 import 'visualizations/spectrogram.dart';
 import 'visualizations/spectrum_bars.dart';
+import 'visualizations/terminal_waves.dart';
 import 'visualizations/vocal_telemetry.dart';
 
 export 'viz_state.dart';
@@ -222,4 +223,5 @@ List<Visualization> buildVisualizations() => <Visualization>[
       BassHalo(),
       VocalTelemetry(),
       VoiceprintSpectrogram(),
+      TerminalWaves(),
     ];

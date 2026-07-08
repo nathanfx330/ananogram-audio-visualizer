@@ -46,6 +46,15 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+/// Pure-Dart blend modes, preventing `dart:ui` imports on background isolates.
+enum SoftBlendMode {
+  /// Standard alpha compositing (Source-Over).
+  srcOver,
+  /// Additive blending. Intersecting colors mathematically add together, 
+  /// creating bright hot-spots. Equivalent to ui.BlendMode.plus.
+  plus,
+}
+
 class SoftCanvas {
   final int width;
   final int height;
@@ -141,6 +150,7 @@ class SoftCanvas {
     int argb, {
     double blurSigma = 0.0,
     bool close = false,
+    SoftBlendMode blendMode = SoftBlendMode.srcOver,
   }) {
     final int n = xy.length >> 1;
     if (n < 2 || strokeWidth <= 0.0 || (argb >> 24) & 0xFF == 0) return;
@@ -155,7 +165,7 @@ class SoftCanvas {
       final int j = (n - 1) << 1;
       _stampCapsule(xy[j], xy[j + 1], xy[0], xy[1], r);
     }
-    _compose(argb, blurSigma);
+    _compose(argb, blurSigma, blendMode);
   }
 
   /// Axis-aligned filled rectangle with analytic edge AA.
@@ -166,6 +176,7 @@ class SoftCanvas {
     double h,
     int argb, {
     double blurSigma = 0.0,
+    SoftBlendMode blendMode = SoftBlendMode.srcOver,
   }) {
     if (w <= 0.0 || h <= 0.0 || (argb >> 24) & 0xFF == 0) return;
     final double right = left + w;
@@ -197,7 +208,7 @@ class SoftCanvas {
       }
     }
     _growDirty(ix0, iy0, ix1, iy1);
-    _compose(argb, blurSigma);
+    _compose(argb, blurSigma, blendMode);
   }
 
   /// Filled oval inscribed in the given rect (Canvas.drawOval with a
@@ -211,6 +222,7 @@ class SoftCanvas {
     double h,
     int argb, {
     double blurSigma = 0.0,
+    SoftBlendMode blendMode = SoftBlendMode.srcOver,
   }) {
     if (w <= 0.0 || h <= 0.0 || (argb >> 24) & 0xFF == 0) return;
     final double rx = w * 0.5;
@@ -249,7 +261,7 @@ class SoftCanvas {
       }
     }
     _growDirty(ix0, iy0, ix1, iy1);
-    _compose(argb, blurSigma);
+    _compose(argb, blurSigma, blendMode);
   }
 
   // -------------------------------------------------------------------------
@@ -384,10 +396,10 @@ class SoftCanvas {
     _dy1 = ey1;
   }
 
-  /// Composites [argb] src-over into the framebuffer wherever the
-  /// dirty rect has coverage, re-zeroing coverage as it goes (this
-  /// maintains the scratch invariant with no separate clear pass).
-  void _compose(int argb, double blurSigma) {
+  /// Composites [argb] src into the framebuffer wherever the
+  /// dirty rect has coverage, re-zeroing coverage as it goes.
+  /// Supports Source-Over and Additive blending modes.
+  void _compose(int argb, double blurSigma, SoftBlendMode blendMode) {
     if (_dx1 <= _dx0 || _dy1 <= _dy0) return;
     if (blurSigma > 0.0) _blurCoverage(blurSigma);
 
@@ -397,22 +409,51 @@ class SoftCanvas {
     final int cb = argb & 0xFF;
 
     final Uint8List px = pixels;
-    for (int y = _dy0; y < _dy1; y++) {
-      int p = y * width + _dx0;
-      for (int x = _dx0; x < _dx1; x++, p++) {
-        final double c = _cov[p];
-        if (c <= 0.0) continue;
-        _cov[p] = 0.0;
 
-        // Straight color + coverage -> premultiplied src, then
-        // src-over against the premultiplied destination.
-        final double sa = a * c;
-        final double ia = 1.0 - sa;
-        final int o = p << 2;
-        px[o] = (cr * sa + px[o] * ia + 0.5).toInt();
-        px[o + 1] = (cg * sa + px[o + 1] * ia + 0.5).toInt();
-        px[o + 2] = (cb * sa + px[o + 2] * ia + 0.5).toInt();
-        px[o + 3] = (255.0 * sa + px[o + 3] * ia + 0.5).toInt();
+    if (blendMode == SoftBlendMode.plus) {
+      // Additive Blending: dest = clamp(dest + src, 0, 255)
+      for (int y = _dy0; y < _dy1; y++) {
+        int p = y * width + _dx0;
+        for (int x = _dx0; x < _dx1; x++, p++) {
+          final double c = _cov[p];
+          if (c <= 0.0) continue;
+          _cov[p] = 0.0; // Clear coverage
+
+          final double sa = a * c; // Premultiplied source alpha
+          final int o = p << 2;
+          
+          // Mathematically add colors (and alpha!) together
+          int nr = px[o] + (cr * sa + 0.5).toInt();
+          int ng = px[o + 1] + (cg * sa + 0.5).toInt();
+          int nb = px[o + 2] + (cb * sa + 0.5).toInt();
+          int na = px[o + 3] + (255.0 * sa + 0.5).toInt();
+          
+          // Clamp at 255 to prevent integer overflow
+          px[o] = nr > 255 ? 255 : nr;
+          px[o + 1] = ng > 255 ? 255 : ng;
+          px[o + 2] = nb > 255 ? 255 : nb;
+          px[o + 3] = na > 255 ? 255 : na;
+        }
+      }
+    } else {
+      // Standard Source-Over Blending
+      for (int y = _dy0; y < _dy1; y++) {
+        int p = y * width + _dx0;
+        for (int x = _dx0; x < _dx1; x++, p++) {
+          final double c = _cov[p];
+          if (c <= 0.0) continue;
+          _cov[p] = 0.0;
+
+          // Straight color + coverage -> premultiplied src, then
+          // src-over against the premultiplied destination.
+          final double sa = a * c;
+          final double ia = 1.0 - sa;
+          final int o = p << 2;
+          px[o] = (cr * sa + px[o] * ia + 0.5).toInt();
+          px[o + 1] = (cg * sa + px[o + 1] * ia + 0.5).toInt();
+          px[o + 2] = (cb * sa + px[o + 2] * ia + 0.5).toInt();
+          px[o + 3] = (255.0 * sa + px[o + 3] * ia + 0.5).toInt();
+        }
       }
     }
   }

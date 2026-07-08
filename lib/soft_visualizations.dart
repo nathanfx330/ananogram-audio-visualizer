@@ -91,6 +91,10 @@ SoftVisualization? softVisualizationFor(String name) {
       return SoftRidgePlotSpectrum();
     case 'Voiceprint Spectrogram':
       return SoftVoiceprintSpectrogram();
+    case 'Vocal Telemetry (Forensic)':
+      return SoftVocalTelemetry();
+    case 'Terminal Waves':
+      return SoftTerminalWaves();
     default:
       return null;
   }
@@ -916,5 +920,269 @@ class SoftVoiceprintSpectrogram implements SoftVisualization {
     } else {
       return _lerpColor(s.midColor, s.coreColor, (v - 0.66) / 0.34);
     }
+  }
+}
+
+class _SoftWaveDef {
+  final double freq;
+  final double speed;
+  final int colorType; // 0 = outer, 1 = mid, 2 = core
+  
+  const _SoftWaveDef({
+    required this.freq,
+    required this.speed,
+    required this.colorType,
+  });
+}
+
+/// CPU twin of TerminalWaves: ASCII grid waves with harmonic interference
+/// and additive blending.
+class SoftTerminalWaves implements SoftVisualization {
+  double _phase = 0.0;
+  double _lastT = -1.0;
+
+  double _smoothBass = 0.0;
+  double _smoothMid = 0.0;
+  double _smoothTreb = 0.0;
+
+  @override
+  String get name => 'Terminal Waves';
+
+  @override
+  void reset() {
+    _phase = 0.0;
+    _lastT = -1.0;
+    _smoothBass = 0.0;
+    _smoothMid = 0.0;
+    _smoothTreb = 0.0;
+  }
+
+  void _advance(VizContext ctx) {
+    double actualDt = 0.0;
+    if (_lastT >= 0.0 && ctx.t >= _lastT) {
+      actualDt = ctx.t - _lastT;
+    }
+    _lastT = ctx.t;
+
+    double rawBass = (math.pow(ctx.bass * 2.0, 0.5).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+    double rawMid  = (math.pow(ctx.midBand * 2.5, 0.5).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+    double rawTreb = (math.pow(ctx.treb * 3.0, 0.5).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+
+    final double tSm = math.pow(0.65, 30.0 * ctx.dt).toDouble();
+    
+    _smoothBass = _smoothBass * tSm + rawBass * (1.0 - tSm);
+    _smoothMid  = _smoothMid  * tSm + rawMid  * (1.0 - tSm);
+    _smoothTreb = _smoothTreb * tSm + rawTreb * (1.0 - tSm);
+
+    double totalEnergy = (_smoothBass + _smoothMid + _smoothTreb) / 3.0;
+    _phase += actualDt * (0.2 + (totalEnergy * 6.0));
+  }
+
+  @override
+  void renderSuppressed(VizContext ctx) {
+    _advance(ctx);
+  }
+
+  @override
+  void render(SoftCanvas canvas, VizContext ctx) {
+    _advance(ctx);
+
+    final double w = ctx.width.toDouble();
+    final double h = ctx.height.toDouble();
+    final WaveformSettings s = ctx.settings;
+
+    final double blockSize = (8.0 * s.strokeScale).clamp(4.0, 32.0);
+    final int cols = (w / blockSize).floor();
+    final int rows = (h / blockSize).floor();
+    
+    if (cols < 2 || rows < 2) return;
+
+    final double xOffset = (w - (cols * blockSize)) / 2.0;
+    final double yOffset = (h - (rows * blockSize)) / 2.0;
+
+    const List<_SoftWaveDef> waves = [
+      _SoftWaveDef(freq: 0.8, speed: -1.0, colorType: 0),
+      _SoftWaveDef(freq: 1.2, speed:  1.3, colorType: 0),
+      _SoftWaveDef(freq: 1.7, speed: -1.6, colorType: 1),
+      _SoftWaveDef(freq: 2.1, speed:  1.9, colorType: 2),
+    ];
+
+    final List<int> colors = [s.outerColor, s.midColor, s.coreColor];
+    final List<int> fillColors = [];
+    final List<int> capColors = [];
+
+    // Pre-calculate the exact ARGB integer combinations for 15% and 70% opacity
+    for (int c in colors) {
+      fillColors.add((c & 0x00FFFFFF) | (38 << 24)); // 0.15 * 255 = ~38
+      capColors.add((c & 0x00FFFFFF) | (178 << 24)); // 0.70 * 255 = ~178
+    }
+
+    final double blur = s.glowBlurSigma > 0.0 ? s.glowBlurSigma : 0.0;
+
+    for (int wIdx = 0; wIdx < waves.length; wIdx++) {
+      final wave = waves[wIdx];
+      final int fillArgb = fillColors[wave.colorType];
+      final int capArgb = capColors[wave.colorType];
+      
+      double waveAmp = 0.05;
+      if (wIdx == 0) waveAmp += _smoothBass;
+      if (wIdx == 1) waveAmp += _smoothMid;
+      if (wIdx == 2) waveAmp += _smoothMid;
+      if (wIdx == 3) waveAmp += _smoothTreb;
+      waveAmp = waveAmp.clamp(0.0, 1.0);
+
+      for (int c = 0; c < cols; c++) {
+        double nx = c / (cols - 1);
+        
+        double envelope = math.pow(math.sin(nx * math.pi), 1.2).toDouble();
+        
+        double p1 = _phase * wave.speed;
+        double p2 = _phase * wave.speed * -1.4;
+
+        double v1 = math.sin(nx * math.pi * 2.0 * wave.freq + p1);
+        double v2 = math.sin(nx * math.pi * 4.3 * wave.freq + p2) * 0.35;
+        
+        double sineVal = (v1 + v2) / 1.35;
+        double upVal = (sineVal + 1.0) / 2.0;
+        
+        double displacement = upVal * waveAmp * envelope * (rows * 0.95);
+        int peakRow = (rows - 1) - displacement.round().clamp(0, rows - 1);
+        
+        for (int drawR = peakRow; drawR < rows; drawR++) {
+          double bx = xOffset + c * blockSize;
+          double by = yOffset + drawR * blockSize;
+          
+          canvas.fillRect(
+            bx + 1, by + 1, blockSize - 2, blockSize - 2,
+            drawR == peakRow ? capArgb : fillArgb,
+            blurSigma: blur,
+            blendMode: SoftBlendMode.plus,
+          );
+        }
+      }
+    }
+  }
+}
+
+/// CPU twin of VocalTelemetry: Forensic telemetry grid with dual envelope display.
+class SoftVocalTelemetry implements SoftVisualization {
+  double _smoothMid = 0.0;
+
+  @override
+  String get name => 'Vocal Telemetry (Forensic)';
+
+  @override
+  void reset() {
+    _smoothMid = 0.0;
+  }
+
+  void _advance(VizContext ctx) {
+    final double tSm = math.pow(0.8, 30.0 * ctx.dt).toDouble();
+    _smoothMid = _smoothMid * tSm + (ctx.midBand * 2.0) * (1.0 - tSm);
+    _smoothMid = _smoothMid.clamp(0.0, 1.0);
+  }
+
+  @override
+  void renderSuppressed(VizContext ctx) {
+    _advance(ctx);
+  }
+
+  @override
+  void render(SoftCanvas canvas, VizContext ctx) {
+    _advance(ctx);
+
+    final double w = ctx.width.toDouble();
+    final double h = ctx.height.toDouble();
+    final WaveformSettings s = ctx.settings;
+
+    // Colors translated to integer ARGB for SoftCanvas
+    final int gridAlpha = (0.3 * 255).toInt();
+    final int gridColor = (s.outerColor & 0x00FFFFFF) | (gridAlpha << 24);
+
+    final int envAlpha = (0.2 * 255).toInt();
+    final int envColor = (s.outerColor & 0x00FFFFFF) | (envAlpha << 24);
+
+    // --- 1. DRAW ANALYTICAL GRID ---
+    final int hLines = 8;
+    for (int i = 1; i < hLines; i++) {
+      final double y = (h / hLines) * i;
+      canvas.fillRect(0, y, w, 1.0, gridColor);
+    }
+
+    final int vLines = 10;
+    final double pixelsPerSecond = w / s.windowDuration;
+    final double timeOffset = (ctx.t * pixelsPerSecond) % (w / vLines);
+    
+    for (int i = 0; i <= vLines + 1; i++) {
+      final double x = w - ((w / vLines) * i) + timeOffset;
+      if (x >= 0 && x <= w) {
+        canvas.fillRect(x, 0, 1.0, 15.0, gridColor);
+        canvas.fillRect(x, h - 15.0, 1.0, 15.0, gridColor);
+      }
+    }
+
+    // --- 2. CALCULATE TIME WINDOW (Looking Backwards) ---
+    int endIdx = ctx.sampleIndexAt(ctx.t);
+    int startIdx = ctx.sampleIndexAt(ctx.t - s.windowDuration);
+    if (startIdx < 0) startIdx = 0;
+    
+    final int chunkLen = endIdx - startIdx;
+    if (chunkLen < 4) return;
+
+    final double midY = h / 2.0;
+    final double stepX = w / (chunkLen > 0 ? chunkLen : 1);
+    final double gain = ctx.dampening * 1.5; 
+
+    // We will build the exact Waveform coordinates for strokePolyline
+    final Float32List xy = Float32List(chunkLen * 2);
+
+    // --- 3. ENVELOPE AND WAVEFORM ---
+    for (int i = 0; i < chunkLen; i++) {
+      final int idx = startIdx + i;
+      double v = idx < ctx.audio.length ? ctx.audio[idx] : 0.0;
+      if (v.isNaN || v.isInfinite) v = 0.0;
+      
+      final double amplitude = (v * gain).clamp(-1.0, 1.0);
+      final double y = midY - (amplitude * (h * 0.45));
+      final double x = i * stepX;
+
+      final int j = i << 1;
+      xy[j] = x;
+      xy[j + 1] = y;
+
+      // Draw the Envelope volume footprint.
+      // SoftCanvas builds complex fills beautifully via max() accumulation 
+      // of tiny vertical rectangles overlapping by half a pixel!
+      final double envAmp = amplitude.abs() * (h * 0.45);
+      if (envAmp > 0.5) {
+        canvas.fillRect(x, midY - envAmp, stepX + 0.5, envAmp * 2.0, envColor);
+      }
+    }
+
+    // --- 4. CRISP WAVEFORM ---
+    final double blur = s.glowBlurSigma > 0.0 ? s.glowBlurSigma : 0.0;
+    
+    canvas.strokePolyline(
+      xy,
+      (1.5 * s.strokeScale).clamp(1.0, 4.0),
+      s.midColor,
+      blurSigma: blur,
+    );
+    canvas.strokePolyline(
+      xy,
+      1.0,
+      s.coreColor,
+    );
+
+    // --- 5. PLAYHEAD ---
+    final int playheadAlpha = (255 * (0.5 + (_smoothMid * 0.5))).toInt().clamp(0, 255);
+    final int playheadColor = (s.coreColor & 0x00FFFFFF) | (playheadAlpha << 24);
+
+    final Float32List phXY = Float32List(4);
+    phXY[0] = w - 2; phXY[1] = 0;
+    phXY[2] = w - 2; phXY[3] = h;
+
+    canvas.strokePolyline(phXY, 3.0, playheadColor, blurSigma: blur > 0.0 ? blur * 2.0 : 0.0);
+    canvas.fillRect(w - 1, 0, 1.0, h, 0xFFFFFFFF); // Sharp Core
   }
 }
