@@ -36,8 +36,8 @@
 //
 // REGISTRY: softVisualizationFor(name) returns a FRESH instance per
 // call (workers must not share plugin state across isolates), or
-// null if the plugin is unported -- the exporter falls back to the
-// GPU path for those, so nothing breaks while the port is partial.
+// null if the plugin is unported -- the exporter falls back to the GPU
+// path for those, so nothing breaks while the port is partial.
 
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -95,6 +95,10 @@ SoftVisualization? softVisualizationFor(String name) {
       return SoftVocalTelemetry();
     case 'Terminal Waves':
       return SoftTerminalWaves();
+    case 'Audio Meters':
+      return SoftAudioMeters();
+    case 'Horizontal Meters':
+      return SoftHorizontalMeters();
     default:
       return null;
   }
@@ -1184,5 +1188,260 @@ class SoftVocalTelemetry implements SoftVisualization {
 
     canvas.strokePolyline(phXY, 3.0, playheadColor, blurSigma: blur > 0.0 ? blur * 2.0 : 0.0);
     canvas.fillRect(w - 1, 0, 1.0, h, 0xFFFFFFFF); // Sharp Core
+  }
+}
+
+/// CPU twin of AudioMeters: dual-channel segmented LED style.
+class SoftAudioMeters implements SoftVisualization {
+  static const int segments = 50;
+  
+  double _levelL = 0.0;
+  double _levelR = 0.0;
+  double _peakHoldL = 0.0;
+  double _peakHoldR = 0.0;
+  double _peakTimerL = 0.0;
+  double _peakTimerR = 0.0;
+
+  @override
+  String get name => 'Audio Meters';
+
+  @override
+  void reset() {
+    _levelL = 0.0;
+    _levelR = 0.0;
+    _peakHoldL = 0.0;
+    _peakHoldR = 0.0;
+    _peakTimerL = 0.0;
+    _peakTimerR = 0.0;
+  }
+
+  void _advance(VizContext ctx) {
+    int start = ctx.sampleIndexAt(ctx.t);
+    int end = ctx.sampleIndexAt(ctx.t + ctx.settings.windowDuration);
+    final int chunkLen = end - start;
+    if (chunkLen < 4) return;
+
+    double peak = 0.0;
+    for (int i = 0; i < chunkLen; i++) {
+      int idx = start + i;
+      double v = idx < ctx.audio.length ? ctx.audio[idx].abs() : 0.0;
+      if (v > peak) peak = v;
+    }
+
+    double targetLevel = (math.pow(peak, 0.7).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+    double targetL = targetLevel;
+    double targetR = targetLevel;
+
+    final double attackSm = math.pow(0.2, 30.0 * ctx.dt).toDouble();
+    final double releaseSm = math.pow(0.85, 30.0 * ctx.dt).toDouble();
+
+    _levelL = targetL > _levelL 
+        ? _levelL * attackSm + targetL * (1.0 - attackSm)
+        : _levelL * releaseSm + targetL * (1.0 - releaseSm);
+        
+    _levelR = targetR > _levelR 
+        ? _levelR * attackSm + targetR * (1.0 - attackSm)
+        : _levelR * releaseSm + targetR * (1.0 - releaseSm);
+
+    _peakTimerL += ctx.dt;
+    if (targetL >= _peakHoldL) {
+      _peakHoldL = targetL;
+      _peakTimerL = 0.0;
+    } else if (_peakTimerL > 1.0) {
+      _peakHoldL = _peakHoldL * releaseSm;
+    }
+
+    _peakTimerR += ctx.dt;
+    if (targetR >= _peakHoldR) {
+      _peakHoldR = targetR;
+      _peakTimerR = 0.0;
+    } else if (_peakTimerR > 1.0) {
+      _peakHoldR = _peakHoldR * releaseSm;
+    }
+  }
+
+  @override
+  void renderSuppressed(VizContext ctx) {
+    _advance(ctx);
+  }
+
+  @override
+  void render(SoftCanvas canvas, VizContext ctx) {
+    _advance(ctx);
+
+    final double w = ctx.width.toDouble();
+    final double h = ctx.height.toDouble();
+    final WaveformSettings s = ctx.settings;
+
+    final double meterWidth = (w * 0.08).clamp(20.0, 150.0);
+    final double gapX = w * 0.02;
+    final double startX_L = (w / 2) - (gapX / 2) - meterWidth;
+    final double startX_R = (w / 2) + (gapX / 2);
+
+    final double startY = WaveformStyle.edgeMargin;
+    final double maxH = h - (WaveformStyle.edgeMargin * 2);
+    final double segH = maxH / segments;
+    final double segGap = segH * 0.15;
+
+    _drawMeter(canvas, s, startX_L, startY, meterWidth, maxH, segH, segGap, _levelL, _peakHoldL);
+    _drawMeter(canvas, s, startX_R, startY, meterWidth, maxH, segH, segGap, _levelR, _peakHoldR);
+  }
+
+  void _drawMeter(SoftCanvas canvas, WaveformSettings s, double x, double y, 
+                  double w, double h, double segH, double gap, double level, double peakHold) {
+    
+    int litSegments = (level * segments).round();
+    int peakSegment = (peakHold * segments).round().clamp(0, segments - 1);
+
+    final int dimColor = (s.outerColor & 0x00FFFFFF) | (25 << 24); // 10% opacity
+    final double blur = s.glowBlurSigma > 0.0 ? s.glowBlurSigma : 0.0;
+
+    for (int i = 0; i < segments; i++) {
+      double segY = (y + h) - ((i + 1) * segH);
+      
+      int activeColor;
+      if (i < segments * 0.65) activeColor = s.outerColor;
+      else if (i < segments * 0.90) activeColor = s.midColor;
+      else activeColor = s.coreColor;
+
+      if (i < litSegments || i == peakSegment) {
+        // SoftCanvas handles the blur and source-over alpha blending
+        canvas.fillRect(x, segY + gap/2, w, segH - gap, activeColor, blurSigma: blur);
+        
+        // Add a brighter inner core
+        final int coreColor = (s.coreColor & 0x00FFFFFF) | (127 << 24); // 50% opacity
+        canvas.fillRect(x + 2, segY + gap/2 + 2, w - 4, segH - gap - 4, coreColor);
+      } else {
+        // Inactive background LED
+        canvas.fillRect(x, segY + gap/2, w, segH - gap, dimColor);
+      }
+    }
+  }
+}
+
+/// CPU twin of HorizontalMeters: dual-channel segmented LED style (Horizontal).
+class SoftHorizontalMeters implements SoftVisualization {
+  static const int segments = 50;
+  
+  double _levelL = 0.0;
+  double _levelR = 0.0;
+  double _peakHoldL = 0.0;
+  double _peakHoldR = 0.0;
+  double _peakTimerL = 0.0;
+  double _peakTimerR = 0.0;
+
+  @override
+  String get name => 'Horizontal Meters';
+
+  @override
+  void reset() {
+    _levelL = 0.0;
+    _levelR = 0.0;
+    _peakHoldL = 0.0;
+    _peakHoldR = 0.0;
+    _peakTimerL = 0.0;
+    _peakTimerR = 0.0;
+  }
+
+  void _advance(VizContext ctx) {
+    int start = ctx.sampleIndexAt(ctx.t);
+    int end = ctx.sampleIndexAt(ctx.t + ctx.settings.windowDuration);
+    final int chunkLen = end - start;
+    if (chunkLen < 4) return;
+
+    double peak = 0.0;
+    for (int i = 0; i < chunkLen; i++) {
+      int idx = start + i;
+      double v = idx < ctx.audio.length ? ctx.audio[idx].abs() : 0.0;
+      if (v > peak) peak = v;
+    }
+
+    double targetLevel = (math.pow(peak, 0.7).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+    double targetL = targetLevel;
+    double targetR = targetLevel;
+
+    final double attackSm = math.pow(0.2, 30.0 * ctx.dt).toDouble();
+    final double releaseSm = math.pow(0.85, 30.0 * ctx.dt).toDouble();
+
+    _levelL = targetL > _levelL 
+        ? _levelL * attackSm + targetL * (1.0 - attackSm)
+        : _levelL * releaseSm + targetL * (1.0 - releaseSm);
+        
+    _levelR = targetR > _levelR 
+        ? _levelR * attackSm + targetR * (1.0 - attackSm)
+        : _levelR * releaseSm + targetR * (1.0 - releaseSm);
+
+    _peakTimerL += ctx.dt;
+    if (targetL >= _peakHoldL) {
+      _peakHoldL = targetL;
+      _peakTimerL = 0.0;
+    } else if (_peakTimerL > 1.0) {
+      _peakHoldL = _peakHoldL * releaseSm;
+    }
+
+    _peakTimerR += ctx.dt;
+    if (targetR >= _peakHoldR) {
+      _peakHoldR = targetR;
+      _peakTimerR = 0.0;
+    } else if (_peakTimerR > 1.0) {
+      _peakHoldR = _peakHoldR * releaseSm;
+    }
+  }
+
+  @override
+  void renderSuppressed(VizContext ctx) {
+    _advance(ctx);
+  }
+
+  @override
+  void render(SoftCanvas canvas, VizContext ctx) {
+    _advance(ctx);
+
+    final double w = ctx.width.toDouble();
+    final double h = ctx.height.toDouble();
+    final WaveformSettings s = ctx.settings;
+
+    final double meterHeight = (h * 0.08).clamp(20.0, 100.0);
+    final double gapY = h * 0.04;
+    
+    final double startY_L = (h / 2) - (gapY / 2) - meterHeight;
+    final double startY_R = (h / 2) + (gapY / 2);
+
+    final double startX = w * 0.05; 
+    final double maxW = w * 0.90; 
+    
+    final double segW = maxW / segments;
+    final double segGap = segW * 0.15;
+
+    _drawMeter(canvas, s, startX, startY_L, maxW, meterHeight, segW, segGap, _levelL, _peakHoldL);
+    _drawMeter(canvas, s, startX, startY_R, maxW, meterHeight, segW, segGap, _levelR, _peakHoldR);
+  }
+
+  void _drawMeter(SoftCanvas canvas, WaveformSettings s, double x, double y, 
+                  double w, double h, double segW, double gap, double level, double peakHold) {
+    
+    int litSegments = (level * segments).round();
+    int peakSegment = (peakHold * segments).round().clamp(0, segments - 1);
+
+    final int dimColor = (s.outerColor & 0x00FFFFFF) | (25 << 24); // 10% opacity
+    final double blur = s.glowBlurSigma > 0.0 ? s.glowBlurSigma : 0.0;
+
+    for (int i = 0; i < segments; i++) {
+      double segX = x + (i * segW);
+      
+      int activeColor;
+      if (i < segments * 0.65) activeColor = s.outerColor;
+      else if (i < segments * 0.90) activeColor = s.midColor;
+      else activeColor = s.coreColor;
+
+      if (i < litSegments || i == peakSegment) {
+        canvas.fillRect(segX + gap/2, y, segW - gap, h, activeColor, blurSigma: blur);
+        
+        final int coreColor = (s.coreColor & 0x00FFFFFF) | (127 << 24); // 50% opacity
+        canvas.fillRect(segX + gap/2 + 2, y + 2, segW - gap - 4, h - 4, coreColor);
+      } else {
+        canvas.fillRect(segX + gap/2, y, segW - gap, h, dimColor);
+      }
+    }
   }
 }

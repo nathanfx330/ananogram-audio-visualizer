@@ -16,9 +16,11 @@ import 'dart:ui' as ui;
 import 'package:flutter/rendering.dart';
 
 import 'viz_state.dart';
+import 'visualizations/audio_meters.dart';
 import 'visualizations/bass_halo.dart';
 import 'visualizations/circular_spectrum.dart';
 import 'visualizations/dot_matrix.dart';
+import 'visualizations/horizontal_meters.dart';
 import 'visualizations/line_spectrum.dart';
 import 'visualizations/phosphor_waveform.dart';
 import 'visualizations/ridge_plot.dart';
@@ -224,4 +226,6 @@ List<Visualization> buildVisualizations() => <Visualization>[
       VocalTelemetry(),
       VoiceprintSpectrogram(),
       TerminalWaves(),
+      AudioMeters(),
+      HorizontalMeters(),
     ];

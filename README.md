@@ -140,6 +140,8 @@ FFT computation is performed lazily, ensuring plugins that do not require freque
 * **Vocal Telemetry (Forensic)** — forensic polygraph-style voice analysis
 * **Voiceprint Spectrogram** — frequency-over-time heatmap
 * **Terminal Waves** — additive harmonic interference rendered on an ASCII grid
+* **Audio Meters** — dual-channel segmented LED peak program meters (vertical layout)
+* **Horizontal Meters** — dual-channel segmented LED peak program meters (horizontal layout)
 
 ---
 
