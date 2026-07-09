@@ -747,7 +747,7 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     Slider(
                       value: _settings.strokeScale,
                       min: 0.25,
-                      max: 4.0,
+                      max: 10.0, // Increased to 10.0 (1000%)
                       onChanged: (v) => both(() {
                         _settings.strokeScale = v;
                         _timeSincePaused = 0.0; // Force render to show width
@@ -760,20 +760,58 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
                     const SizedBox(height: 8),
                     Wrap(
                       spacing: 8,
-                      children: _phosphorPresets.map((p) {
-                        final bool active = _presetMatches(p);
-                        return ChoiceChip(
-                          label: Text(p.name),
-                          selected: active,
-                          avatar: CircleAvatar(backgroundColor: p.mid, radius: 8),
-                          onSelected: (_) => both(() {
-                            _settings.outerColor = p.outer.value;
-                            _settings.midColor = p.mid.value;
-                            _settings.coreColor = p.core.value;
-                            _timeSincePaused = 0.0; // Force render to show color
-                          }),
-                        );
-                      }).toList(),
+                      children: [
+                        ..._phosphorPresets.map((p) {
+                          final bool active = _presetMatches(p);
+                          return ChoiceChip(
+                            label: Text(p.name),
+                            selected: active,
+                            avatar: CircleAvatar(backgroundColor: p.mid, radius: 8),
+                            onSelected: (_) => both(() {
+                              _settings.outerColor = p.outer.value;
+                              _settings.midColor = p.mid.value;
+                              _settings.coreColor = p.core.value;
+                              _timeSincePaused = 0.0; // Force render to show color
+                            }),
+                          );
+                        }),
+                        ActionChip(
+                          label: const Text('Custom...'),
+                          avatar: const Icon(Icons.color_lens, size: 16),
+                          onPressed: () async {
+                            final int origOuter = _settings.outerColor;
+                            final int origMid = _settings.midColor;
+                            final int origCore = _settings.coreColor;
+
+                            final result = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) => _CustomColorPickerDialog(
+                                outer: _settings.outerColor,
+                                mid: _settings.midColor,
+                                core: _settings.coreColor,
+                                onChanged: (o, m, c) {
+                                  both(() {
+                                    _settings.outerColor = o;
+                                    _settings.midColor = m;
+                                    _settings.coreColor = c;
+                                    _timeSincePaused = 0.0;
+                                  });
+                                },
+                              ),
+                            );
+
+                            // If cancelled, restore original colors
+                            if (result != true) {
+                              both(() {
+                                _settings.outerColor = origOuter;
+                                _settings.midColor = origMid;
+                                _settings.coreColor = origCore;
+                                _timeSincePaused = 0.0;
+                              });
+                            }
+                          },
+                        ),
+                      ],
                     ),
                   ],
                 ),
@@ -990,6 +1028,215 @@ class _AnanogramHomeState extends State<AnanogramHome> with SingleTickerProvider
           ],
         ),
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Custom Color Picker Dialog
+// ---------------------------------------------------------------------------
+
+class _CustomColorPickerDialog extends StatefulWidget {
+  final int outer;
+  final int mid;
+  final int core;
+  final void Function(int outer, int mid, int core) onChanged;
+
+  const _CustomColorPickerDialog({
+    required this.outer,
+    required this.mid,
+    required this.core,
+    required this.onChanged,
+  });
+
+  @override
+  State<_CustomColorPickerDialog> createState() => _CustomColorPickerDialogState();
+}
+
+class _CustomColorPickerDialogState extends State<_CustomColorPickerDialog> {
+  late Color _outer;
+  late Color _mid;
+  late Color _core;
+
+  @override
+  void initState() {
+    super.initState();
+    _outer = Color(widget.outer);
+    _mid = Color(widget.mid);
+    _core = Color(widget.core);
+  }
+
+  void _notifyChange() {
+    widget.onChanged(_outer.value, _mid.value, _core.value);
+  }
+
+  Widget _buildSlider(String label, int value, Color activeColor, ValueChanged<int> onChanged) {
+    return Row(
+      children: [
+        SizedBox(width: 20, child: Text(label, style: const TextStyle(fontWeight: FontWeight.bold))),
+        Expanded(
+          child: Slider(
+            value: value.toDouble(),
+            min: 0,
+            max: 255,
+            activeColor: activeColor,
+            onChanged: (v) => onChanged(v.toInt()),
+          ),
+        ),
+        SizedBox(width: 30, child: Text(value.toString().padLeft(3, ' '))),
+      ],
+    );
+  }
+
+  Widget _buildColorTab(Color color, ValueChanged<Color> onChanged) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16.0),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Material(
+            color: color,
+            borderRadius: BorderRadius.circular(8),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () async {
+                final Color? picked = await showDialog<Color>(
+                  context: context,
+                  builder: (ctx) => _SwatchPickerDialog(),
+                );
+                if (picked != null) {
+                  onChanged(picked);
+                }
+              },
+              child: Container(
+                height: 48,
+                width: double.infinity,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.white24, width: 1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Center(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.palette, color: Colors.white, shadows: [Shadow(color: Colors.black54, blurRadius: 4)]),
+                      SizedBox(width: 8),
+                      Text('Tap for swatches', style: TextStyle(color: Colors.white, shadows: [Shadow(color: Colors.black54, blurRadius: 4)], fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildSlider('R', color.red, Colors.red, (v) => onChanged(color.withRed(v))),
+          _buildSlider('G', color.green, Colors.green, (v) => onChanged(color.withGreen(v))),
+          _buildSlider('B', color.blue, Colors.blue, (v) => onChanged(color.withBlue(v))),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Custom Palette'),
+      content: SizedBox(
+        width: 320,
+        child: DefaultTabController(
+          length: 3,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const TabBar(
+                tabs: [
+                  Tab(text: 'Outer'),
+                  Tab(text: 'Mid'),
+                  Tab(text: 'Core'),
+                ],
+              ),
+              SizedBox(
+                height: 240,
+                child: TabBarView(
+                  children: [
+                    _buildColorTab(_outer, (c) {
+                      setState(() => _outer = c);
+                      _notifyChange();
+                    }),
+                    _buildColorTab(_mid, (c) {
+                      setState(() => _mid = c);
+                      _notifyChange();
+                    }),
+                    _buildColorTab(_core, (c) {
+                      setState(() => _core = c);
+                      _notifyChange();
+                    }),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, true),
+          child: const Text('Apply'),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Swatch Picker Dialog
+// ---------------------------------------------------------------------------
+
+class _SwatchPickerDialog extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final List<Color> swatches = [
+      Colors.red, Colors.pink, Colors.purple, Colors.deepPurple,
+      Colors.indigo, Colors.blue, Colors.lightBlue, Colors.cyan,
+      Colors.teal, Colors.green, Colors.lightGreen, Colors.lime,
+      Colors.yellow, Colors.amber, Colors.orange, Colors.deepOrange,
+      Colors.brown, Colors.grey, Colors.blueGrey, Colors.white,
+      Colors.black,
+    ];
+
+    return AlertDialog(
+      title: const Text('Select a Color'),
+      content: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: swatches.map((Color c) {
+          return Material(
+            color: c,
+            shape: CircleBorder(
+              side: BorderSide(
+                color: c == Colors.black ? Colors.white24 : Colors.transparent, 
+                width: 1
+              )
+            ),
+            clipBehavior: Clip.antiAlias,
+            elevation: 2,
+            child: InkWell(
+              onTap: () => Navigator.pop(context, c),
+              child: const SizedBox(width: 40, height: 40),
+            ),
+          );
+        }).toList(),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+      ],
     );
   }
 }

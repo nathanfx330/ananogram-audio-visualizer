@@ -77,6 +77,8 @@ SoftVisualization? softVisualizationFor(String name) {
   switch (name) {
     case 'Phosphor Waveform':
       return SoftPhosphorWaveform();
+    case 'Density Spectrum':
+      return SoftDensitySpectrum();
     case 'Spectrum Bars':
       return SoftSpectrumBars();
     case 'Line Spectrum':
@@ -221,6 +223,105 @@ class SoftPhosphorWaveform implements SoftVisualization {
       WaveformStyle.coreWidth * scale,
       s.coreColor,
     );
+  }
+}
+
+/// CPU twin of Density Spectrum
+class SoftDensitySpectrum implements SoftVisualization {
+  static const int barCount = 128;
+  static const double smoothing = 0.6;
+  static const double loHz = 20.0;
+  static const double hiHz = 16000.0;
+
+  final List<double> _levels = List<double>.filled(barCount, 0.0);
+
+  @override
+  String get name => 'Density Spectrum';
+
+  @override
+  void reset() {
+    for (int i = 0; i < barCount; i++) _levels[i] = 0.0;
+  }
+
+  void _advance(VizContext ctx) {
+    final Float32List spec = ctx.spectrum;
+    final double binHz = ctx.sampleRate / VizContext.fftSize;
+
+    final double logLo = math.log(loHz);
+    final double logHi = math.log(hiHz);
+    final double tSm = math.pow(smoothing, 30.0 * ctx.dt).toDouble();
+
+    for (int b = 0; b < barCount; b++) {
+      final double f0 = math.exp(logLo + (logHi - logLo) * b / barCount);
+      final double f1 = math.exp(logLo + (logHi - logLo) * (b + 1) / barCount);
+      int k0 = (f0 / binHz).floor().clamp(0, spec.length - 1);
+      int k1 = (f1 / binHz).ceil().clamp(k0 + 1, spec.length);
+
+      double peak = 0.0;
+      for (int k = k0; k < k1; k++) {
+        if (spec[k] > peak) peak = spec[k];
+      }
+
+      double level = (math.pow(peak, 0.55).toDouble() * ctx.dampening).clamp(0.0, 1.0);
+      _levels[b] = _levels[b] * tSm + level * (1.0 - tSm);
+    }
+  }
+
+  @override
+  void renderSuppressed(VizContext ctx) {
+    _advance(ctx);
+  }
+
+  @override
+  void render(SoftCanvas canvas, VizContext ctx) {
+    _advance(ctx);
+
+    final double w = ctx.width.toDouble();
+    final double h = ctx.height.toDouble();
+    final WaveformSettings s = ctx.settings;
+    
+    final double maxH = h - (WaveformStyle.edgeMargin * 2);
+    final double barW = w / barCount;
+    final double dashW = barW * 1.5; 
+    // Uncapped thickness! Scales fully with the slider, with a minimum of 1.0px
+    final double dashH = math.max(1.0, 2.0 * s.strokeScale);
+    final double bottomY = h - WaveformStyle.edgeMargin;
+
+    // Stem alpha: 0.15 * 255 = 38
+    final int stemColor = (s.outerColor & 0x00FFFFFF) | (38 << 24);
+    final double blur = s.glowBlurSigma > 0.0 ? s.glowBlurSigma : 0.0;
+
+    for (int b = 0; b < barCount; b++) {
+      if (_levels[b] < 0.01) continue;
+
+      final double x = b * barW;
+      final double peakY = bottomY - (_levels[b] * maxH);
+
+      // 1. Draw the faint vertical fill to ground the wave
+      canvas.fillRect(x + (barW * 0.1), peakY, barW * 0.8, bottomY - peakY, stemColor);
+      
+      // 2. Calculate how many scanline ticks to draw based on amplitude
+      final int maxDots = 35;
+      final int numDots = (_levels[b] * maxDots).round().clamp(1, maxDots);
+
+      for(int d = 0; d < numDots; d++) {
+        double t = numDots > 1 ? d / (numDots - 1) : 1.0;
+        double yRatio = 1.0 - math.pow(1.0 - t, 2.5).toDouble();
+        double y = bottomY - (yRatio * _levels[b] * maxH);
+
+        double opacity = math.pow(t, 1.5).toDouble(); 
+        
+        if (d == numDots - 1) { 
+          // Absolute peak gets the bright core color and blur
+          canvas.fillRect(x - (dashW - barW) / 2, y, dashW, dashH, s.coreColor, blurSigma: blur);
+        } else {
+          // Body lines get fading mid color
+          int a = (opacity * 0.8 * 255).toInt().clamp(0, 255);
+          int tickColor = (s.midColor & 0x00FFFFFF) | (a << 24);
+          canvas.fillRect(x - (dashW - barW) / 2, y, dashW, dashH, tickColor);
+        }
+      }
+    }
   }
 }
 

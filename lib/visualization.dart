@@ -19,6 +19,7 @@ import 'viz_state.dart';
 import 'visualizations/audio_meters.dart';
 import 'visualizations/bass_halo.dart';
 import 'visualizations/circular_spectrum.dart';
+import 'visualizations/density_spectrum.dart';
 import 'visualizations/dot_matrix.dart';
 import 'visualizations/horizontal_meters.dart';
 import 'visualizations/line_spectrum.dart';
@@ -139,7 +140,7 @@ class VizCompositor {
 
   // --- LIVE PATH (Non-recursive, lightning fast, leak-proof) ---
   ui.Image advance(Visualization viz, VizContext ctx, {bool isExport = false}) {
-    // 0. Handle timeline scrubs (time goes backwards)
+    // 0. Handle timeline scrubs (time backwards)
     if (_liveHistory.isNotEmpty && ctx.t < _liveHistory.last.t) {
       for (final f in _liveHistory) f.image.dispose();
       _liveHistory.clear();
@@ -217,6 +218,7 @@ class VizCompositor {
 /// Built-in visualization registry. Order is UI order.
 List<Visualization> buildVisualizations() => <Visualization>[
       PhosphorWaveform(),
+      DensitySpectrum(),
       SpectrumBars(),
       LineSpectrum(),
       CircularSpectrum(),
